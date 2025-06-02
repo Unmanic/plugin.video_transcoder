@@ -41,6 +41,7 @@ from video_transcoder.lib.encoders.libx import LibxEncoder
 from video_transcoder.lib.encoders.qsv import QsvEncoder
 from video_transcoder.lib.encoders.vaapi import VaapiEncoder
 from video_transcoder.lib.encoders.nvenc import NvencEncoder
+from video_transcoder.lib.encoders.libsvtav1 import LibsvtAv1Encoder
 
 from unmanic.libs.unplugins.settings import PluginSettings
 from unmanic.libs.directoryinfo import UnmanicDirectoryInfo
@@ -95,6 +96,7 @@ class Settings(PluginSettings):
             QsvEncoder,
             VaapiEncoder,
             NvencEncoder,
+            LibsvtAv1Encoder,
         ]
         for encoder_class in encoder_libs:
             encoder_lib = encoder_class(self)
@@ -115,11 +117,13 @@ class Settings(PluginSettings):
         qsv_options = QsvEncoder(self.settings).options()
         vaapi_options = VaapiEncoder(self.settings).options()
         nvenc_options = NvencEncoder(self.settings).options()
+        libsvtav1_options = LibsvtAv1Encoder(self.settings).options()
         return {
             **libx_options,
             **qsv_options,
             **vaapi_options,
             **nvenc_options,
+            **libsvtav1_options,
         }
 
     def __build_settings_object(self):

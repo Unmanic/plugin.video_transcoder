@@ -28,6 +28,7 @@ from video_transcoder.lib.encoders.libx import LibxEncoder
 from video_transcoder.lib.encoders.qsv import QsvEncoder
 from video_transcoder.lib.encoders.vaapi import VaapiEncoder
 from video_transcoder.lib.encoders.nvenc import NvencEncoder
+from video_transcoder.lib.encoders.libsvtav1 import LibsvtAv1Encoder
 from video_transcoder.lib.ffmpeg import StreamMapper
 
 # Configure plugin logger
@@ -151,6 +152,7 @@ class PluginStreamMapper(StreamMapper):
         qsv_encoder = QsvEncoder(self.settings)
         vaapi_encoder = VaapiEncoder(self.settings)
         nvenc_encoder = NvencEncoder(self.settings)
+        stva1_encoder = LibsvtAv1Encoder(self.settings)
 
         # Apply smart filters first
         required_hw_smart_filters = []
@@ -320,6 +322,7 @@ class PluginStreamMapper(StreamMapper):
                 qsv_encoder = QsvEncoder(self.settings)
                 vaapi_encoder = VaapiEncoder(self.settings)
                 nvenc_encoder = NvencEncoder(self.settings)
+                stva1_encoder = LibsvtAv1Encoder(self.settings)
 
                 # Add encoder args
                 if self.settings.get_setting('video_encoder') in libx_encoder.provides():
@@ -332,6 +335,8 @@ class PluginStreamMapper(StreamMapper):
                     generic_kwargs, stream_encoding_args = nvenc_encoder.args(stream_info, stream_id)
                     self.set_ffmpeg_generic_options(**generic_kwargs)
                     stream_encoding += stream_encoding_args
+                elif self.settings.get_setting('video_encoder') in stva1_encoder.provides():
+                    stream_encoding += stva1_encoder.args(stream_id)
         elif codec_type in ['data']:
             if not self.settings.get_setting('apply_smart_filters'):
                 # If smart filters are not enabled, return 'False' to let the default mapping just copy the data stream

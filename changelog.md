@@ -1,3 +1,5 @@
+**<span style="color:#56adda">0.1.7</span>**
+- Add support for the STV-AV1 encoder
 
 **<span style="color:#56adda">0.1.6</span>**
 - Fix bug causing files to be perpetually added to the task queue if mode is set to advanced, but the smart filters were previously applied
