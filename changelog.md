@@ -1,3 +1,6 @@
+**<span style="color:#56adda">0.1.9</span>**
+- Add some safety rails to the black-bar detection so we ignore bars of a few px
+
 **<span style="color:#56adda">0.1.8</span>**
 - Improvements to black-bar detection
 

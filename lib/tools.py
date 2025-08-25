@@ -192,11 +192,135 @@ def detect_plack_bars(abspath, probe_data):
         m = re.findall(r'\[Parsed_cropdetect.*\].*crop=(\d+:\d+:\d+:\d+)', output_text)
         return m[-1] if m else None
 
-    def _ffmpeg_sample(ss: int, t_seconds: Optional[int]) -> str:
+    def _get_pix_fmt(streams) -> Optional[str]:
+        if isinstance(streams, list):
+            for s in streams:
+                if s.get("codec_type") == "video":
+                    return s.get("pix_fmt")
+        return None
+
+    def _choose_round_and_minbar(pix_fmt: Optional[str]) -> tuple[int, int]:
         """
-        Run a sample with cropdetect at a given start time and optional duration.
-        Returns 'NO_CROP' or a crop string 'w:h:x:y'.
+        Pick crop rounding & minimum bar threshold:
+          - 4:2:0 or 4:2:2 -> even alignment (mod 2) is required for safe chroma placement
+          - min_bar_px guards against 1–2 px micro-crops causing loops
         """
+        if pix_fmt and ("420" in pix_fmt or "422" in pix_fmt):
+            return 2, 6  # round to even; ignore <6 px bars
+        # 4:4:4 or unknown: even is still safe everywhere
+        return 2, 6
+
+    def _normalise_crop_or_nocrop(crop_str: str, src_w: int, src_h: int,
+                                  min_sum_tb: int,
+                                  r_to: int,
+                                  min_bar_lr: int = 6) -> str:
+        """
+        Normalize crop from cropdetect. Enforces:
+          - vertical guard: if (top + bottom) < min_sum_tb -> no vertical crop
+          - horizontal guard: left/right < min_bar_lr individually -> zero them (optional safety)
+          - round offsets/dims down to multiples of r_to
+        Returns 'w:h:x:y' or 'NO_CROP'.
+        """
+        if not crop_str or ":" not in crop_str:
+            return "NO_CROP"
+
+        w_s, h_s, x_s, y_s = crop_str.split(":")
+        w, h, x, y = int(w_s), int(h_s), int(x_s), int(y_s)
+
+        # Native size -> no crop
+        if w == src_w and h == src_h and x == 0 and y == 0:
+            return "NO_CROP"
+
+        # Bars from the raw suggestion
+        top = y
+        left = x
+        bottom = src_h - (y + h)
+        right = src_w - (x + w)
+
+        # --- Vertical "sum" rule ---
+        if (top + bottom) < min_sum_tb:
+            top = 0
+            bottom = 0
+
+        # --- Horizontal micro-crop guard (optional but prevents 1–2 px pillarbox loops) ---
+        def too_small(v: int, thr: int) -> bool:
+            return 0 < v < thr
+
+        if too_small(left, min_bar_lr):  left = 0
+        if too_small(right, min_bar_lr):  right = 0
+
+        # If nothing remains to trim, skip
+        if top == 0 and bottom == 0 and left == 0 and right == 0:
+            return "NO_CROP"
+
+        # Rebuild crop rectangle from (possibly modified) bars
+        x_n = left
+        y_n = top
+        w_n = src_w - left - right
+        h_n = src_h - top - bottom
+        if w_n <= 0 or h_n <= 0:
+            return "NO_CROP"
+
+        # Round down for alignment
+        def rdown(v: int, m: int) -> int:
+            return (v // m) * m if m > 1 else v
+
+        x_r = rdown(x_n, r_to)
+        y_r = rdown(y_n, r_to)
+        w_r = rdown(w_n, r_to)
+        h_r = rdown(h_n, r_to)
+
+        # Keep inside frame
+        if x_r + w_r > src_w:
+            w_r = rdown(src_w - x_r, r_to)
+        if y_r + h_r > src_h:
+            h_r = rdown(src_h - y_r, r_to)
+
+        # Recompute bars after rounding
+        top_r = y_r
+        left_r = x_r
+        bottom_r = src_h - (y_r + h_r)
+        right_r = src_w - (x_r + w_r)
+
+        # Re-apply vertical sum guard AFTER rounding (rounding can lower the sum)
+        if (top_r + bottom_r) < min_sum_tb:
+            # remove vertical crop, keep horizontal if any
+            top_r = 0
+            bottom_r = 0
+            y_r = 0
+            h_r = src_h - (top_r + bottom_r)
+            # re-round height to alignment
+            h_r = rdown(h_r, r_to)
+            if y_r + h_r > src_h:
+                h_r = rdown(src_h - y_r, r_to)
+            # recompute bars after adjusting verticals
+            bottom_r = src_h - (y_r + h_r)
+
+        # Re-apply horizontal micro guard after rounding
+        if too_small(left_r, min_bar_lr):
+            left_r = 0
+            x_r = 0
+            w_r = rdown(src_w - right_r, r_to)
+        if too_small(right_r, min_bar_lr):
+            right_r = 0
+            w_r = rdown(src_w - x_r, r_to)
+
+        # If after all guards there's no crop left, bail
+        if top_r == 0 and bottom_r == 0 and left_r == 0 and right_r == 0:
+            return "NO_CROP"
+
+        # Native after rounding? -> no crop
+        if w_r == src_w and h_r == src_h and x_r == 0 and y_r == 0:
+            return "NO_CROP"
+
+        # Log normalization if the rect changed
+        if (x_r, y_r, w_r, h_r) != (x, y, w, h):
+            logger.debug("[BB Detection][Safety] Normalised crop %s -> %d:%d:%d:%d (bars t=%d,b=%d,l=%d,r=%d)",
+                         crop_str, w_r, h_r, x_r, y_r, top_r, bottom_r, left_r, right_r)
+
+        return f"{w_r}:{h_r}:{x_r}:{y_r}"
+
+    def _ffmpeg_sample(ss: int, t_seconds: Optional[int], r_to: Optional[int]) -> str:
         mapper = StreamMapper(logger, ['video', 'audio', 'subtitle', 'data', 'attachment'])
         mapper.set_input_file(abspath)
         # Seek to the sample start
@@ -204,7 +328,7 @@ def detect_plack_bars(abspath, probe_data):
 
         # Configure time-based cropdetect filter at sample end timestamp
         adv_args = ["-an", "-sn", "-dn"]
-        adv_kwargs = {"-vf": "cropdetect"}
+        adv_kwargs = {"-vf": f"cropdetect=round={r_to}:reset=0"}
         if t_seconds and t_seconds > 0:
             adv_kwargs["-t"] = str(int(t_seconds))
         mapper.set_ffmpeg_advanced_options(*adv_args, **adv_kwargs)
@@ -260,21 +384,32 @@ def detect_plack_bars(abspath, probe_data):
     # Probe & scheduling
     # -------------------------
     vid_width, vid_height, _ = get_video_stream_data(probe_data.get('streams'))
-    src_w, src_h = str(vid_width), str(vid_height)
+    src_w, src_h = int(vid_width), int(vid_height)
+
+    pix_fmt = _get_pix_fmt(probe_data.get('streams'))
+    round_to, min_bar_px = _choose_round_and_minbar(pix_fmt)
 
     total_duration = _get_video_duration_seconds_from_probe(probe_data)
 
     MAX_SAMPLES = 7
-    logger.info("[BB Detection] Sampling video file to detect black bars for '%s'", abspath)
+    logger.info("[BB Detection] Sampling video file '%s' (width:%s, height:%s) to detect black bars",
+                abspath, src_w, src_h)
 
     # Special case: very short videos (<60s) → single full-file pass
     if total_duration is not None and total_duration < 60:
         logger.debug("[BB Detection] Duration < 60s. Sampling single full-file pass")
-        observed = _ffmpeg_sample(ss=0, t_seconds=None)
+        observed = _ffmpeg_sample(ss=0, t_seconds=None, r_to=round_to)
+        observed_raw = _ffmpeg_sample(ss=0, t_seconds=None, r_to=round_to)
+
         logger.debug("[BB Detection] Sample #1 @ 0s → %s", observed)
         if observed != "NO_CROP":
-            cw, ch, *_ = observed.split(":")
-            if cw == src_w and ch == src_h:
+            observed = _normalise_crop_or_nocrop(
+                observed_raw, src_w, src_h,
+                min_sum_tb=12,
+                r_to=round_to,
+            )
+            if observed == "NO_CROP":
+                logger.debug("[BB Detection] Decision: NO_CROP (normalised from %s).", observed_raw)
                 return None
             logger.debug("[BB Detection] Decision: CROP=%s.", observed)
             return observed
@@ -333,31 +468,37 @@ def detect_plack_bars(abspath, probe_data):
         if samples_taken >= MAX_SAMPLES:
             break
 
-        observed = _ffmpeg_sample(ss=int(ss), t_seconds=sample_len)
-
-        # Normalize native-size crop to NO_CROP
-        if observed != "NO_CROP":
-            cw, ch, *_ = observed.split(":")
-            if cw == src_w and ch == src_h:
-                logger.debug(
-                    "[BB Detection] Sample @ %ss returned native-sized crop %sx%s; treating as NO_CROP.",
-                    ss, cw, ch
-                )
-                observed = "NO_CROP"
+        raw_observed = _ffmpeg_sample(ss=int(ss), t_seconds=sample_len, r_to=round_to)
+        if raw_observed == "NO_CROP":
+            observed = "NO_CROP"
+            logger.debug("[BB Detection] Sample #%d @ %ss → raw=NO_CROP", samples_taken + 1, ss)
+        else:
+            observed = _normalise_crop_or_nocrop(
+                raw_observed, src_w, src_h,
+                min_sum_tb=12,
+                r_to=round_to,
+            )
+            if observed == "NO_CROP":
+                logger.debug("[BB Detection] Sample #%d @ %ss → raw=%s, normalised=NO_CROP",
+                             samples_taken + 1, ss, raw_observed)
+            elif observed != raw_observed:
+                logger.debug("[BB Detection] Sample #%d @ %ss → raw=%s, normalised=%s",
+                             samples_taken + 1, ss, raw_observed, observed)
+            else:
+                logger.debug("[BB Detection] Sample #%d @ %ss → %s", samples_taken + 1, ss, observed)
 
         samples_taken += 1
         if samples_taken == 3:
             third_sample_value = observed
 
-        # Maintain rolling window of last 3
+        # Rolling window…
         last_three.append(observed)
         if len(last_three) > 3:
             last_three.pop(0)
 
-        logger.debug("[BB Detection] Sample #%d @ %ss → %s (current sample results=%s)",
-                     samples_taken, ss, observed, last_three)
+        logger.debug("[BB Detection] Current sample results=%s", last_three)
 
-        # Early stop after 2 if identical
+        # Early stop after 2…
         if len(last_three) == 2 and last_three[0] == last_three[1]:
             if last_three[0] == "NO_CROP":
                 logger.debug("[BB Detection] Decision: NO_CROP (2/2 agreement).")
@@ -365,13 +506,11 @@ def detect_plack_bars(abspath, probe_data):
             logger.debug("[BB Detection] Decision: CROP=%s (2/2 agreement).", last_three[0])
             return last_three[0]
 
-        # From 3 onward: check 2-of-3 quorum on the rolling window
+        # 2-of-3 quorum…
         if len(last_three) == 3:
             decision = _quorum(last_three)
             if decision is not None:
-                # non-trivial crop has 2-of-3
-                logger.debug("[BB Detection] Decision: CROP=%s (2/3 majority on %s).",
-                             decision, last_three)
+                logger.debug("[BB Detection] Decision: CROP=%s (2/3 majority on %s).", decision, last_three)
                 return decision
             if last_three.count("NO_CROP") >= 2:
                 logger.debug("[BB Detection] Decision: NO_CROP (2/3 majority on %s).", last_three)
