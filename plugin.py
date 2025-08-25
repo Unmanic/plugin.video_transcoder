@@ -304,7 +304,6 @@ def on_postprocessor_task_results(data):
 
     :param data:
     :return:
-
     """
     # Get settings
     settings = Settings(library_id=data.get('library_id'))
@@ -315,11 +314,19 @@ def on_postprocessor_task_results(data):
         logger.error("Provided 'source_data' is missing the source file abspath data.")
         return
 
-    # Mark the source file to be ignored on subsequent scans if 'force_transcode' was enabled
+    # Ensure destination_files is present and not empty
+    if not data.get('destination_files'):
+        logger.error("No destination files found.")
+        return
+
+    # Get the path of the transcoded file
+    transcoded_file_path = data['destination_files'][0]
+
+    # Mark the transcoded file to be ignored on subsequent scans if 'force_transcode' was enabled
     if settings.get_setting('force_transcode'):
         cache_directory = os.path.dirname(data.get('final_cache_path'))
         if os.path.exists(os.path.join(cache_directory, '.force_transcode')):
-            directory_info = UnmanicDirectoryInfo(os.path.dirname(original_source_path))
-            directory_info.set('video_transcoder', os.path.basename(original_source_path), 'force_transcoded')
+            directory_info = UnmanicDirectoryInfo(os.path.dirname(transcoded_file_path))
+            directory_info.set('video_transcoder', os.path.basename(transcoded_file_path), 'force_transcoded')
             directory_info.save()
-            logger.debug("Ignore on next scan written for '%s'.", original_source_path)
+            logger.debug("Ignore on next scan written for '%s'.", transcoded_file_path)
