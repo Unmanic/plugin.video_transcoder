@@ -1,3 +1,6 @@
+**<span style="color:#56adda">0.1.8</span>**
+- Improvements to black-bar detection
+
 **<span style="color:#56adda">0.1.7</span>**
 - Add support for the STV-AV1 encoder
 
