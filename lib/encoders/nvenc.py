@@ -171,11 +171,11 @@ class NvencEncoder:
             # Add filter to upload software frames to CUDA for CUDA filters
             # Note, format conversion (if any - eg yuv422p10le -> p010le) happens after the software filters.
             # If a user applies a custom software filter that does not support the pix_fmt, then will need to prefix it with 'format=p010le'
-            sw_filter_suffix_args.append(f'format={sw_fmt}|cuda,hwupload_cuda')
+            sw_filter_suffix_args.append(f'format={sw_fmt},hwupload_cuda')
         # If we have no software filters:
-        else:
+        elif not hw_decode:
             # Add hwupload filter that can handle when the frame was decoded in software or hardware
-            hw_filter_args.append(f'format={sw_fmt}|cuda,hwupload_cuda')
+            hw_filter_args.append(f'format={sw_fmt},hwupload_cuda')
 
         # Loop over any HW smart filters to be applied and add them as required.
         for smart_filter in hw_smart_filters:
