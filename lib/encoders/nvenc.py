@@ -500,7 +500,8 @@ class NvencEncoder:
         values = {
             "label":       "Enable Temporal Adaptive Quantization",
             "description": "This adjusts the quantization parameter across frames, based on the motion and temporal complexity.\n"
-                           "This is particularly effective in scenes with varying levels of motion, enhancing quality where it's most needed.",
+                           "This is particularly effective in scenes with varying levels of motion, enhancing quality where it's most needed.\n"
+                           "This option requires Turing or newer hardware.",
             "sub_setting": True,
         }
         if self.settings.get_setting('mode') not in ['standard']:

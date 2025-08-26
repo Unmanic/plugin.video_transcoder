@@ -1,3 +1,9 @@
+**<span style="color:#56adda">0.1.10</span>**
+- Adds better management of 10Bit video formats for NVIDIA, Intel, and AMD hardware. 
+- Adds an improved fallback system to prevent failed decodes for QSV.
+- The video scaling smart filter has been improved to correctly work with custom resolutions and different aspect ratios.
+- A new debugging tool has been added to make troubleshooting and development easier.
+
 **<span style="color:#56adda">0.1.9</span>**
 - Add some safety rails to the black-bar detection so we ignore bars of a few px
 
