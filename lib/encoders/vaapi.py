@@ -122,13 +122,51 @@ class VaapiEncoder:
 
         return generic_kwargs, advanced_kwargs
 
-    def generate_filtergraphs(self):
+    def generate_filtergraphs(self, settings, has_sw_filters, hw_smart_filters, target_fmt="nv12"):
         """
         Generate the required filter for enabling VAAPI HW acceleration
 
         :return:
         """
-        return ["format=nv12|vaapi,hwupload"]
+        generic_kwargs = {}
+        advanced_kwargs = {}
+        hw_filter_args = []
+        sw_filter_prefix_args = []
+        sw_filter_suffix_args = []
+
+        # Check if we are decoding with VAAPI
+        hw_decode = settings.get_setting('vaapi_enabled_hw_decoding')
+        # Check software format to use
+        sw_fmt = "p010le" if target_fmt == "p010" else "nv12"
+
+        # If we have SW filters:
+        if has_sw_filters:
+            # If we have SW filters and HW decode is enabled, make decoder produce SW frames
+            if hw_decode:
+                generic_kwargs['-hwaccel_output_format'] = sw_fmt
+            # Add filter to upload software frames to VAAPI for VAAPI filters
+            # Note, format conversion (if any - eg yuv422p10le -> p010le) happens after the software filters.
+            # If a user applies a custom software filter that does not support the pix_fmt, then will need to prefix it with 'format=p010le'
+            sw_filter_suffix_args.append(f'format={sw_fmt}|vaapi,hwupload')
+        # If we have no software filters:
+        else:
+            # Add hwupload filter that can handle when the frame was decoded in software or hardware
+            hw_filter_args.append(f'format={sw_fmt}|vaapi,hwupload')
+
+        # Loop over any HW smart filters to be applied and add them as required.
+        for smart_filter in hw_smart_filters:
+            if smart_filter.get('scale'):
+                scale_values = smart_filter.get('scale')
+                hw_filter_args.append('scale_vaapi=w={}:h=-1'.format(scale_values["width"]))
+
+        # Return built args
+        return {
+            "generic_kwargs":        generic_kwargs,
+            "advanced_kwargs":       advanced_kwargs,
+            "hw_filter_args":        hw_filter_args,
+            "sw_filter_prefix_args": sw_filter_prefix_args,
+            "sw_filter_suffix_args": sw_filter_suffix_args,
+        }
 
     def encoder_details(self, encoder):
         provides = self.provides()
@@ -215,10 +253,14 @@ class VaapiEncoder:
         return values
 
     def get_vaapi_enabled_hw_decoding_form_settings(self):
+        # TODO: Change this to a select dropdown like the others
         values = {
             "label":       "Enable HW Decoding",
+            "description": "Warning: Ensure your device supports decoding the source video codec or it will fail.\n"
+                           "This enables full hardware transcode with VAAPI, using only GPU memory for the entire video transcode.\n"
+                           "If filters are configured in the plugin, decoder will output NV12 or P010LE software surfaces to\n"
+                           "those filters which will be slightly slower.",
             "sub_setting": True,
-            "description": "Will fallback to software decoding and hardware encoding when the input codec is not supported.",
         }
         if self.settings.get_setting('mode') not in ['standard']:
             values["display"] = "hidden"

@@ -143,21 +143,53 @@ class NvencEncoder:
                 generic_kwargs["-hwaccel_output_format"] = "cuda"
         return generic_kwargs, advanced_kwargs
 
-    def generate_filtergraphs(self, software_filters, hw_smart_filters):
+    def generate_filtergraphs(self, settings, has_sw_filters, hw_smart_filters, target_fmt="nv12"):
         """
-        Generate the required filter for enabling NVENC HW acceleration
+        Generate the required filter for enabling NVENC/CUDA HW acceleration.
 
         :return:
         """
-        filters = []
-        if software_filters:
-            # Software filters mean the decoder was outputting nv12 surfaces. We need to upload back to cuda first
-            filters.append('hwupload_cuda')
+        generic_kwargs = {}
+        advanced_kwargs = {}
+        hw_filter_args = []
+        sw_filter_prefix_args = []
+        sw_filter_suffix_args = []
+
+        # Check for HW accelerated decode mode
+        # All decode methods ('cuda', 'nvdec', 'cuvid') are handled by the same
+        # filtergraph logic and output CUDA fames. The main FFmpeg command handles the specific decoder.
+        hw_decode = (settings.get_setting('nvenc_decoding_method') or '').lower() in ('cuda', 'nvdec', 'cuvid')
+
+        # Check software format to use
+        sw_fmt = "p010le" if target_fmt == "p010" else "nv12"
+
+        # If we have SW filters:
+        if has_sw_filters:
+            # If we have SW filters and HW decode (CUDA/NVDEC) is enabled, make decoder produce SW frames
+            if hw_decode:
+                generic_kwargs['-hwaccel_output_format'] = sw_fmt
+            # Add filter to upload software frames to CUDA for CUDA filters
+            # Note, format conversion (if any - eg yuv422p10le -> p010le) happens after the software filters.
+            # If a user applies a custom software filter that does not support the pix_fmt, then will need to prefix it with 'format=p010le'
+            sw_filter_suffix_args.append(f'format={sw_fmt}|cuda,hwupload_cuda')
+        # If we have no software filters:
+        else:
+            # Add hwupload filter that can handle when the frame was decoded in software or hardware
+            hw_filter_args.append(f'format={sw_fmt}|cuda,hwupload_cuda')
+
+        # Loop over any HW smart filters to be applied and add them as required.
         for smart_filter in hw_smart_filters:
             if smart_filter.get('scale'):
                 scale_values = smart_filter.get('scale')
-                filters.append('scale_cuda={}:-1'.format(scale_values[0]))
-        return filters
+                hw_filter_args.append('scale_cuda={}:-1'.format(scale_values["width"]))
+
+        return {
+            "generic_kwargs":        generic_kwargs,
+            "advanced_kwargs":       advanced_kwargs,
+            "hw_filter_args":        hw_filter_args,
+            "sw_filter_prefix_args": sw_filter_prefix_args,
+            "sw_filter_suffix_args": sw_filter_suffix_args,
+        }
 
     def encoder_details(self, encoder):
         hardware_devices = list_available_cuda_devices()

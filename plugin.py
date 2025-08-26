@@ -34,7 +34,7 @@ TODO:
 import logging
 import os
 
-from video_transcoder.lib import plugin_stream_mapper
+from video_transcoder.lib import plugin_stream_mapper, tools
 from video_transcoder.lib.ffmpeg import Parser, Probe
 from video_transcoder.lib.global_settings import GlobalSettings
 from video_transcoder.lib.encoders.libx import LibxEncoder
@@ -267,6 +267,11 @@ def on_worker_process(data):
             new_file_out = "{}.{}".format(split_file_out[0], container_extension.lstrip('.'))
             mapper.set_output_file(new_file_out)
             data['file_out'] = new_file_out
+
+
+        # # Pretty, wrapped printing of the command to null for debugging. Should always be commented out.
+        # mapper.set_output_null()
+        # print(tools.format_command_multiline(mapper, max_width=120))
 
         # Get generated ffmpeg args
         ffmpeg_args = mapper.get_ffmpeg_args()

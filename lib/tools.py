@@ -23,6 +23,7 @@
 """
 import logging
 import re
+import shlex
 import subprocess
 from collections import Counter
 from typing import List, Optional, Iterable
@@ -126,6 +127,57 @@ def get_video_stream_data(streams):
             break
 
     return width, height, video_stream_index
+
+
+
+def format_command_multiline(mapper, max_width=120, indent="  "):
+    """
+    Prints command for debugging...
+    Pretty-print a shell command with flag/value grouping and hard wraps.
+
+    - max_width: wrap line when it would exceed this width
+    - indent: indent used at the start of wrapped lines
+    """
+
+    ffmpeg_args = mapper.get_ffmpeg_args()
+    cmd = ['ffmpeg']
+    cmd += ffmpeg_args
+
+    # Quote everything for safe copy/paste
+    q = [shlex.quote(x) for x in cmd]
+
+    # Head is the binary; tail are the arguments we want to group/wrap
+    head, tail = q[0], q[1:]
+
+    # Group (flag + value) when it's "-something" followed by a non-flag token
+    chunks = []
+    i = 0
+    while i < len(tail):
+        cur = tail[i]
+        nxt = tail[i + 1] if i + 1 < len(tail) else None
+        if cur.startswith("-") and nxt is not None and not nxt.startswith("-"):
+            chunks.append(f"{cur} {nxt}")
+            i += 2
+        else:
+            chunks.append(cur)
+            i += 1
+
+    # Now wrap into lines <= max_width
+    lines = [head]  # start with the binary on the first line
+    cur = head
+    for chunk in chunks:
+        # try to append to current line
+        attempt = f"{cur} {chunk}"
+        if len(attempt) <= max_width:
+            cur = attempt
+            lines[-1] = cur
+        else:
+            # wrap to a new line
+            cur = f"{indent}{chunk}"
+            lines.append(cur)
+
+    # Join with line continuations
+    return " \\\n".join(lines)
 
 
 def detect_plack_bars(abspath, probe_data):

@@ -35,6 +35,59 @@ from video_transcoder.lib.ffmpeg import StreamMapper
 logger = logging.getLogger("Unmanic.Plugin.video_transcoder")
 
 
+def target_pix_fmt_for_encoder(encoder_name: str, src_pix_fmt: str) -> str:
+    """
+    Determines the target pixel format for a given encoder based on the source pixel format.
+
+    Args:
+        encoder_name: The name of the FFmpeg encoder (e.g., "hevc_vaapi").
+        src_pix_fmt: The source video's pixel format (e.g., "yuv420p10le").
+
+    Returns:
+        The target pixel format string supported by the encoder.
+    """
+    enc = (encoder_name or "").lower()
+    src = (src_pix_fmt or "").lower()
+
+    # H.264 (AVC) does not support >8-bit color depth
+    is_h264 = "h264" in enc
+
+    # Determine bit depth of the source pixel format
+    is_10bit_or_more = any(tag in src for tag in ("10", "12", "p010", "p016"))
+
+    # Check for known hardware encoders and map to their supported formats
+    if "vaapi" in enc:
+        if is_10bit_or_more and not is_h264:
+            # VAAPI 10-bit support is p010 (for HEVC, AV1, etc.)
+            return "p010"
+        else:
+            # VAAPI 8-bit support is nv12
+            return "nv12"
+
+    if "qsv" in enc:
+        if is_10bit_or_more and not is_h264:
+            # QSV 10-bit support is p010 (for HEVC, AV1, etc.)
+            return "p010"
+        else:
+            # QSV 8-bit support is nv12
+            return "nv12"
+
+    if "nvenc" in enc:
+        if is_10bit_or_more and not is_h264:
+            # NVENC 10-bit support is p010 (for HEVC, AV1, etc.)
+            return "p010"
+        else:
+            # NVENC 8-bit support is nv12
+            return "nv12"
+
+    # For software encoders (or any other case),
+    # map to a common and widely supported format.
+    if is_10bit_or_more:
+        return "yuv420p10le"
+    else:
+        return "yuv420p"
+
+
 class PluginStreamMapper(StreamMapper):
     def __init__(self):
         super(PluginStreamMapper, self).__init__(logger, ['video', 'data', 'attachment'])
@@ -147,6 +200,12 @@ class PluginStreamMapper(StreamMapper):
         software_filters = []
         hardware_filters = []
 
+        # Get source pix_fmt
+        src_pix_fmt = self.probe.get_video_stream_pix_fmt()
+
+        # Get configured encoder name
+        encoder_name = self.settings.get_setting('video_encoder')
+
         # Load encoder classes
         libx_encoder = LibxEncoder(self.settings)
         qsv_encoder = QsvEncoder(self.settings)
@@ -154,21 +213,27 @@ class PluginStreamMapper(StreamMapper):
         nvenc_encoder = NvencEncoder(self.settings)
         stva1_encoder = LibsvtAv1Encoder(self.settings)
 
+        # HW accelerated encoder libs
+        encoder_libs = [qsv_encoder, vaapi_encoder, nvenc_encoder]
+        hw_encoder = next((lib for lib in encoder_libs if encoder_name in lib.provides()), None)
+
         # Apply smart filters first
-        required_hw_smart_filters = []
+        hw_smart_filters = []
         if self.settings.get_setting('apply_smart_filters'):
+            # NOTE: Crop must come first. Filters like scale will ruin the crop values
             if self.settings.get_setting('autocrop_black_bars') and self.crop_value:
                 software_filters.append('crop={}'.format(self.crop_value))
             if self.settings.get_setting('target_resolution') not in ['source']:
                 vid_width, vid_height = self.scale_resolution(stream_info)
                 if vid_height:
-                    # Apply scale with only height to keep aspect ratio
-                    if self.settings.get_setting('video_encoder') in qsv_encoder.provides():
-                        required_hw_smart_filters.append({'scale': [vid_width, vid_height]})
-                    elif self.settings.get_setting('video_encoder') in nvenc_encoder.provides():
-                        required_hw_smart_filters.append({'scale': [vid_width, vid_height]})
+                    # Apply scale filter with hw accel if available
+                    if hw_encoder:
+                        hw_smart_filters.append({'scale': {"width": vid_width, "height": vid_height}})
                     else:
-                        software_filters.append('scale=-1:{}'.format(vid_height))
+                        # Apply scale with only width to keep aspect ratio.
+                        # NOTE: Use width since this may follow the black bar crop which will likely crop
+                        # height not width changing the aspect ratio.
+                        software_filters.append('scale={}:-1'.format(vid_width))
 
         # Apply custom software filters
         if self.settings.get_setting('apply_custom_filters'):
@@ -177,29 +242,29 @@ class PluginStreamMapper(StreamMapper):
                     software_filters.append(software_filter.strip())
 
         # Check for hardware encoders that required video filters
-        if self.settings.get_setting('video_encoder') in qsv_encoder.provides():
-            # Add filtergraph required for using QSV encoding
-            generic_kwargs, advanced_kwargs, filter_args = qsv_encoder.generate_filtergraphs(self.settings, software_filters,
-                                                                                             required_hw_smart_filters)
-            self.set_ffmpeg_generic_options(**generic_kwargs)
-            self.set_ffmpeg_advanced_options(**advanced_kwargs)
-            hardware_filters += filter_args
-        elif self.settings.get_setting('video_encoder') in vaapi_encoder.provides():
-            # Add filtergraph required for using VAAPI encoding
-            hardware_filters += vaapi_encoder.generate_filtergraphs()
-            # If we are using software filters, then disable vaapi surfaces.
-            # Instead, output software frames
-            if software_filters:
-                self.set_ffmpeg_generic_options(**{'-hwaccel_output_format': 'nv12'})
-        elif self.settings.get_setting('video_encoder') in nvenc_encoder.provides():
-            # Add filtergraph required for using CUDA encoding
-            hardware_filters += nvenc_encoder.generate_filtergraphs(software_filters, required_hw_smart_filters)
-            # If we are using software filters, then disable cuda surfaces.
-            # Instead, output software frames
-            if software_filters:
-                self.set_ffmpeg_generic_options(**{'-hwaccel_output_format': 'nv12'})
+        target_fmt = target_pix_fmt_for_encoder(encoder_name, src_pix_fmt)
 
-        # TODO: Add HW scaling filter if available (disable software filter above)
+        # Apply custom filtergraph logic for hw accelerators
+        if hw_encoder:
+            filtergraph_config = hw_encoder.generate_filtergraphs(
+                self.settings,
+                bool(software_filters),
+                hw_smart_filters,
+                target_fmt
+            )
+
+            generic_kwargs = filtergraph_config.get('generic_kwargs', {})
+            self.set_ffmpeg_generic_options(**generic_kwargs)
+
+            advanced_kwargs = filtergraph_config.get('advanced_kwargs', {})
+            self.set_ffmpeg_advanced_options(**advanced_kwargs)
+
+            hw_filter_args = filtergraph_config.get('hw_filter_args', [])
+            hardware_filters += hw_filter_args
+
+            sw_filter_prefix_args = filtergraph_config.get('sw_filter_prefix_args', [])
+            sw_filter_suffix_args = filtergraph_config.get('sw_filter_suffix_args', [])
+            software_filters = sw_filter_prefix_args + software_filters + sw_filter_suffix_args
 
         # Return here if there are no filters to apply
         if not software_filters and not hardware_filters:
@@ -208,27 +273,27 @@ class PluginStreamMapper(StreamMapper):
         # Join filtergraph
         filtergraph = ''
         count = 1
-        for filter in software_filters:
+        for filter_string in software_filters:
             # If we are appending to existing filters, separate by a semicolon to start a new chain
             if filtergraph:
                 filtergraph += ';'
             # Add the input for this filter
             filtergraph += '[{}]'.format(filter_id)
             # Add filtergraph
-            filtergraph += '{}'.format(filter)
+            filtergraph += '{}'.format(filter_string)
             # Update filter ID and add it to the end
             filter_id = '0:vf:{}-{}'.format(stream_id, count)
             filtergraph += '[{}]'.format(filter_id)
             # Increment filter ID counter
             count += 1
-        for filter in hardware_filters:
+        for filter_string in hardware_filters:
             # If we are appending to existing filters, separate by a semicolon to start a new chain
             if filtergraph:
                 filtergraph += ';'
             # Add the input for this filter
             filtergraph += '[{}]'.format(filter_id)
             # Add filtergraph
-            filtergraph += '{}'.format(filter)
+            filtergraph += '{}'.format(filter_string)
             # Update filter ID and add it to the end
             filter_id = '0:vf:{}-{}'.format(stream_id, count)
             filtergraph += '[{}]'.format(filter_id)
