@@ -89,16 +89,16 @@ class PluginStreamMapper(StreamMapper):
             if self.settings.get_setting('apply_smart_filters'):
                 if self.settings.get_setting('autocrop_black_bars'):
                     # Test if the file has black bars
-                    self.crop_value = tools.detect_black_bars(abspath, probe.get_probe())
+                    self.crop_value = tools.detect_black_bars(abspath, probe.get_probe(), self.settings)
 
         # Build hardware acceleration args based on encoder
         # Note: these are not applied to advanced mode - advanced mode was returned above
-        for encoder_name in self.settings.encoders:
-            encoder_lib = self.settings.encoders.get(encoder_name)
-            if self.settings.get_setting('video_encoder') in encoder_lib.provides():
-                generic_kwargs, advanced_kwargs = encoder_lib.generate_default_args()
-                self.set_ffmpeg_generic_options(**generic_kwargs)
-                self.set_ffmpeg_advanced_options(**advanced_kwargs)
+        encoder_name = self.settings.get_setting('video_encoder')
+        encoder_lib = tools.available_encoders(settings=self.settings).get(encoder_name)
+        if encoder_lib:
+            generic_kwargs, advanced_kwargs = encoder_lib.generate_default_args()
+            self.set_ffmpeg_generic_options(**generic_kwargs)
+            self.set_ffmpeg_advanced_options(**advanced_kwargs)
 
     def scale_resolution(self, stream_info: dict):
         def get_test_resolution(settings):
@@ -142,7 +142,6 @@ class PluginStreamMapper(StreamMapper):
         :param stream_id:
         :return:
         """
-        filter_id = '0:v:{}'.format(stream_id)
         software_filters = []
         hardware_filters = []
         filter_args = []
@@ -221,21 +220,8 @@ class PluginStreamMapper(StreamMapper):
             return None, None
 
         # Join filtergraph
-        filtergraph = ''
-        count = 1
-        for filter_string in filter_args:
-            # If we are appending to existing filters, separate by a semicolon to start a new chain
-            if filtergraph:
-                filtergraph += ';'
-            # Add the input for this filter
-            filtergraph += '[{}]'.format(filter_id)
-            # Add filtergraph
-            filtergraph += '{}'.format(filter_string)
-            # Update filter ID and add it to the end
-            filter_id = '0:vf:{}-{}'.format(stream_id, count)
-            filtergraph += '[{}]'.format(filter_id)
-            # Increment filter ID counter
-            count += 1
+        filter_id = '0:v:{}'.format(stream_id)
+        filter_id, filtergraph = tools.join_filtergraph(filter_id, filter_args, stream_id)
 
         return filter_id, filtergraph
 

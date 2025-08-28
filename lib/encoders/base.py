@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
+import logging
+
+logger = logging.getLogger("Unmanic.Plugin.video_transcoder")
+
 
 class Encoder:
-    def __init__(self, settings, probe=None):
+    def __init__(self, settings=None, probe=None):
         self.settings = settings
+        self.probe = probe
+
+    def set_probe(self, probe=None, probe_info=None):
+        if isinstance(probe_info, dict):
+            from video_transcoder.lib.ffmpeg import Probe
+            probe = Probe(logger, allowed_mimetypes=['video'])
+            probe.set_probe(probe_info)
         self.probe = probe
 
     def _target_pix_fmt_for_encoder(self, encoder_name: str) -> str:
@@ -96,7 +107,6 @@ class Encoder:
             "color_tags":          color_tags,
             "stream_color_params": stream_color_params,
         }
-        print(result)
         # TODO: Check if we need this
         # result.update(encoder_config)
         return result

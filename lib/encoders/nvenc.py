@@ -89,8 +89,8 @@ def get_configured_device(settings):
 
 
 class NvencEncoder(Encoder):
-    def __init__(self, settings, probe=None):
-        super().__init__(settings, probe=probe)
+    def __init__(self, settings=None, probe=None):
+        super().__init__(settings=settings, probe=probe)
 
     def _map_pix_fmt(self, is_h264: bool, is_10bit: bool) -> str:
         if is_10bit and not is_h264:

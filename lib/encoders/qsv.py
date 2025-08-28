@@ -35,8 +35,8 @@ from video_transcoder.lib.encoders.base import Encoder
 
 
 class QsvEncoder(Encoder):
-    def __init__(self, settings, probe=None):
-        super().__init__(settings, probe=probe)
+    def __init__(self, settings=None, probe=None):
+        super().__init__(settings=settings, probe=probe)
 
     def _map_pix_fmt(self, is_h264: bool, is_10bit: bool) -> str:
         if is_10bit and not is_h264:
@@ -79,8 +79,8 @@ class QsvEncoder(Encoder):
         # Encode only (no decoding)
         #   REF: https://trac.ffmpeg.org/wiki/Hardware/QuickSync#Transcode
         generic_kwargs = {
-            "-init_hw_device":   "qsv=hw",
-            "-filter_hw_device": "hw",
+            "-init_hw_device":   "qsv=qsv0",
+            "-filter_hw_device": "qsv0",
         }
         advanced_kwargs = {}
         # Check if we are using a HW accelerated decoder> Modify args as required
@@ -88,8 +88,6 @@ class QsvEncoder(Encoder):
             generic_kwargs.update({
                 "-hwaccel":               "qsv",
                 "-hwaccel_output_format": "qsv",
-                "-init_hw_device":        "qsv=hw",
-                "-filter_hw_device":      "hw",
             })
         return generic_kwargs, advanced_kwargs
 

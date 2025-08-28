@@ -49,8 +49,8 @@ def list_available_vaapi_devices():
 
 
 class VaapiEncoder(Encoder):
-    def __init__(self, settings, probe=None):
-        super().__init__(settings, probe=probe)
+    def __init__(self, settings=None, probe=None):
+        super().__init__(settings=settings, probe=probe)
 
     def _map_pix_fmt(self, is_h264: bool, is_10bit: bool) -> str:
         if is_10bit and not is_h264:
@@ -130,10 +130,9 @@ class VaapiEncoder(Encoder):
                 "-hwaccel":               "vaapi",
                 "-hwaccel_output_format": "vaapi",
                 "-hwaccel_device":        dev_id,
+                "-filter_hw_device":      dev_id,
             }
-            advanced_kwargs = {
-                "-filter_hw_device": dev_id,
-            }
+            advanced_kwargs = {}
         else:
             # Encode only (no decoding)
             #   REF: https://trac.ffmpeg.org/wiki/Hardware/VAAPI#Encode-only (sorta)
