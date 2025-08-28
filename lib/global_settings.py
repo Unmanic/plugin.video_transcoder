@@ -368,7 +368,8 @@ class GlobalSettings:
     def get_custom_software_filters_form_settings(self):
         values = {
             "label":       "Custom video filters",
-            "description": "Video filters and filter chains - https://trac.ffmpeg.org/wiki/FilteringGuide",
+            "description": "Video filters and filter chains - https://trac.ffmpeg.org/wiki/FilteringGuide.\n"
+                           "Note that any hardware accelerated filters may need to implement the appropriate hwupload filter.",
             "tooltip":     "Separate each filter chain by a linebreak",
             "sub_setting": True,
             "input_type":  "textarea",

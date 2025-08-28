@@ -180,7 +180,7 @@ def format_command_multiline(mapper, max_width=120, indent="  "):
     return " \\\n".join(lines)
 
 
-def detect_plack_bars(abspath, probe_data):
+def detect_black_bars(abspath, probe_data):
     """
     Detect black bars via ffmpeg cropdetect using quorum logic across multiple samples.
 
