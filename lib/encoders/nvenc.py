@@ -119,6 +119,7 @@ class NvencEncoder(Encoder):
             "nvenc_profile":                       "main",
             "nvenc_encoder_ratecontrol_method":    "auto",
             "nvenc_encoder_ratecontrol_lookahead": 0,
+            "nvenc_constant_quantizer_scale":      23,
             "nvenc_enable_spatial_aq":             False,
             "nvenc_enable_temporal_aq":            False,
             "nvenc_aq_strength":                   8,
@@ -279,6 +280,14 @@ class NvencEncoder(Encoder):
         if self.settings.get_setting('nvenc_encoder_ratecontrol_method') in ['constqp', 'vbr', 'cbr']:
             # Set the rate control method
             stream_args += [f'-rc:v:{stream_id}', str(self.settings.get_setting('nvenc_encoder_ratecontrol_method'))]
+            if self.settings.get_setting('nvenc_encoder_ratecontrol_method') == 'constqp':
+                qp_value = self.settings.get_setting('nvenc_constant_quantizer_scale')
+                try:
+                    qp_value = int(qp_value)
+                except (TypeError, ValueError):
+                    qp_value = -1
+                if qp_value >= 0:
+                    stream_args += [f'-qp:v:{stream_id}', str(qp_value)]
         rc_la = int(self.settings.get_setting('nvenc_encoder_ratecontrol_lookahead') or 0)
         if rc_la > 0:
             stream_args += [f'-rc-lookahead:v:{stream_id}', str(rc_la)]
@@ -547,6 +556,24 @@ class NvencEncoder(Encoder):
             },
         }
         if self.settings.get_setting('mode') not in ['standard']:
+            values["display"] = "hidden"
+        return values
+
+    def get_nvenc_constant_quantizer_scale_form_settings(self):
+        # Lower is better
+        values = {
+            "label":          "Constant quantizer scale",
+            "description":    "Sets the quantizer when rate control is set to CQP. Lower values increase quality. Use -1 for NVENC defaults.",
+            "sub_setting":    True,
+            "input_type":     "slider",
+            "slider_options": {
+                "min": -1,
+                "max": 51,
+            },
+        }
+        if self.settings.get_setting('mode') not in ['standard']:
+            values["display"] = "hidden"
+        if self.settings.get_setting('nvenc_encoder_ratecontrol_method') != 'constqp':
             values["display"] = "hidden"
         return values
 
