@@ -85,11 +85,11 @@ class PluginStreamMapper(StreamMapper):
                 }
                 self.set_ffmpeg_advanced_options(**advanced_kwargs)
 
-            # Check for config specific settings
-            if self.settings.get_setting('apply_smart_filters'):
-                if self.settings.get_setting('autocrop_black_bars'):
-                    # Test if the file has black bars
-                    self.crop_value = tools.detect_black_bars(abspath, probe.get_probe(), self.settings)
+        # Check for config specific settings in modes that expose smart filters
+        if self.settings.get_setting('mode') in ['basic', 'standard']:
+            if self.settings.get_setting('apply_smart_filters') and self.settings.get_setting('autocrop_black_bars'):
+                # Test if the file has black bars
+                self.crop_value = tools.detect_black_bars(abspath, probe.get_probe(), self.settings)
 
         # Build hardware acceleration args based on encoder
         # Note: these are not applied to advanced mode - advanced mode was returned above
@@ -245,11 +245,11 @@ class PluginStreamMapper(StreamMapper):
         if self.settings.get_setting('apply_smart_filters'):
             # Video filters
             if codec_type in ['video']:
-                if self.settings.get_setting('mode') == 'standard':
-                    # Check if autocrop filter needs to be applied (standard mode only)
+                if self.settings.get_setting('mode') in ['basic', 'standard']:
+                    # Check if autocrop filter needs to be applied
                     if self.settings.get_setting('autocrop_black_bars') and self.crop_value:
                         return True
-                    # Check if scale filter needs to be applied (standard mode only)
+                    # Check if scale filter needs to be applied
                     if self.settings.get_setting('target_resolution') not in ['source']:
                         vid_width, vid_height = self.scale_resolution(stream_info)
                         if vid_width:

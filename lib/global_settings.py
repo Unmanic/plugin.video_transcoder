@@ -255,7 +255,7 @@ class GlobalSettings:
             "label":   "Enable plugin's smart video filters",
             "tooltip": "Provides some pre-configured FFmpeg filtergraphs",
         }
-        if self.settings.get_setting('mode') not in ['standard']:
+        if self.settings.get_setting('mode') not in ['basic', 'standard']:
             values["display"] = 'hidden'
         return values
 
@@ -269,7 +269,7 @@ class GlobalSettings:
         }
         if not self.settings.get_setting('apply_smart_filters'):
             values["display"] = 'hidden'
-        if self.settings.get_setting('mode') not in ['standard']:
+        if self.settings.get_setting('mode') not in ['basic', 'standard']:
             values["display"] = 'hidden'
         return values
 
@@ -332,7 +332,7 @@ class GlobalSettings:
         }
         if not self.settings.get_setting('apply_smart_filters'):
             values["display"] = 'hidden'
-        if self.settings.get_setting('mode') not in ['standard']:
+        if self.settings.get_setting('mode') not in ['basic', 'standard']:
             values["display"] = 'hidden'
         return values
 
@@ -348,7 +348,7 @@ class GlobalSettings:
         }
         if not self.settings.get_setting('apply_smart_filters'):
             values["display"] = 'hidden'
-        if self.settings.get_setting('mode') not in ['standard']:
+        if self.settings.get_setting('mode') not in ['basic', 'standard']:
             values["display"] = 'hidden'
         return values
 
@@ -363,7 +363,7 @@ class GlobalSettings:
         }
         if not self.settings.get_setting('apply_smart_filters'):
             values["display"] = 'hidden'
-        if self.settings.get_setting('mode') not in ['standard']:
+        if self.settings.get_setting('mode') not in ['basic', 'standard']:
             values["display"] = 'hidden'
         return values
 
