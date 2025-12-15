@@ -135,6 +135,7 @@ class Settings(PluginSettings):
         advanced_input_options = global_settings.get('advanced_input_options')
         output_settings = global_settings.get('output_settings')
         filter_settings = global_settings.get('filter_settings')
+        smart_output_target = global_settings.get('smart_output_target')
         return {
             **main_options,
             **encoder_selection,
@@ -142,6 +143,7 @@ class Settings(PluginSettings):
             **advanced_input_options,
             **output_settings,
             **filter_settings,
+            **smart_output_target,
         }
 
 
@@ -273,6 +275,8 @@ def on_worker_process(data):
         # print(tools.format_command_multiline(mapper, max_width=120))
 
         # Get generated ffmpeg args
+        mapper.enable_execution_stage()
+        mapper.streams_need_processing()
         ffmpeg_args = mapper.get_ffmpeg_args()
 
         # Apply ffmpeg args to command

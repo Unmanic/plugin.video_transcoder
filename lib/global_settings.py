@@ -79,6 +79,10 @@ class GlobalSettings:
                 "apply_custom_filters":     False,
                 "custom_software_filters":  "",
             },
+            "smart_output_target":   {
+                "enable_smart_output_target": False,
+                "smart_output_target":        "balanced",
+            },
         }
 
     def __set_default_option(self, select_options, key, default_option=None):
@@ -373,6 +377,45 @@ class GlobalSettings:
             "tooltip": "Provides text input for adding custom FFmpeg filtergraphs",
         }
         if self.settings.get_setting('mode') not in ['standard']:
+            values["display"] = 'hidden'
+        return values
+
+    def get_enable_smart_output_target_form_settings(self):
+        values = {
+            "label":       "Enable smart output target",
+            "description": "Automatically detects the best FFmpeg encoder params to use based on the source file.",
+            "req_lev":     2,
+        }
+        if self.settings.get_setting('mode') not in ['basic']:
+            values["display"] = 'hidden'
+        return values
+
+    def get_smart_output_target_form_settings(self):
+        values = {
+            "label":          "Smart output target",
+            "description":    "Select the goal that best matches how you want Basic mode to balance quality and compression.",
+            "sub_setting":    True,
+            "req_lev":        2,
+            "input_type":     "select",
+            "select_options": [
+                {
+                    "value": "prefer_quality",
+                    "label": "Prefer Quality",
+                },
+                {
+                    "value": "balanced",
+                    "label": "Balanced",
+                },
+                {
+                    "value": "prefer_compression",
+                    "label": "Prefer Compression",
+                },
+            ],
+        }
+        self.__set_default_option(values['select_options'], 'smart_output_target', default_option='balanced')
+        if not self.settings.get_setting('enable_smart_output_target'):
+            values["display"] = 'hidden'
+        if self.settings.get_setting('mode') not in ['basic']:
             values["display"] = 'hidden'
         return values
 

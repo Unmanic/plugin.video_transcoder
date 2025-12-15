@@ -32,6 +32,7 @@ import re
 import subprocess
 
 from video_transcoder.lib.encoders.base import Encoder
+from video_transcoder.lib.smart_output_target import SmartOutputTargetHelper
 
 logger = logging.getLogger("Unmanic.Plugin.video_transcoder")
 
@@ -91,6 +92,69 @@ def get_configured_device(settings):
 class NvencEncoder(Encoder):
     def __init__(self, settings=None, probe=None):
         super().__init__(settings=settings, probe=probe)
+
+    def _smart_basic_stream_args(self, defaults, stream_id, filter_state):
+        """
+        Build smart output target args for basic mode, returning the stream args list.
+        """
+        stream_args = []
+        smart_recommendation = None
+        try:
+            helper = SmartOutputTargetHelper(self.probe, logger_override=logger)
+            file_path = None
+            try:
+                file_path = (self.probe.get_probe() or {}).get("format", {}).get("filename")
+            except Exception:
+                file_path = None
+            target_filters = {
+                "target_width":  filter_state.get("target_width") if filter_state else None,
+                "target_height": filter_state.get("target_height") if filter_state else None,
+                "scale_applied": filter_state.get("scale_applied") if filter_state else False,
+                "crop_applied":  filter_state.get("crop_applied") if filter_state else False,
+            }
+            source_stats = helper.collect_source_stats(file_path=file_path)
+            goal = self.settings.get_setting('smart_output_target')
+            smart_recommendation = helper.recommend_params(goal, source_stats, target_filters)
+        except Exception as exc:
+            logger.info("Smart output target unavailable, falling back to defaults: %s", exc)
+
+        if smart_recommendation:
+            preset_value = smart_recommendation.get("preset", defaults.get('nvenc_preset'))
+            stream_args += ['-preset', str(preset_value)]
+
+            rc_mode = smart_recommendation.get("rc_mode")
+            if rc_mode:
+                stream_args += [f'-rc:v:{stream_id}', str(rc_mode)]
+            if smart_recommendation.get("qp") is not None:
+                stream_args += [f'-qp:v:{stream_id}', str(int(smart_recommendation.get("qp")))]
+            if smart_recommendation.get("cq") is not None:
+                stream_args += [f'-cq:v:{stream_id}', str(int(smart_recommendation.get("cq")))]
+            if smart_recommendation.get("maxrate"):
+                stream_args += [f'-maxrate:v:{stream_id}', str(int(smart_recommendation.get("maxrate")))]
+            if smart_recommendation.get("bufsize"):
+                stream_args += [f'-bufsize:v:{stream_id}', str(int(smart_recommendation.get("bufsize")))]
+            if smart_recommendation.get("lookahead"):
+                stream_args += [f'-rc-lookahead:v:{stream_id}', str(int(smart_recommendation.get("lookahead")))]
+            if smart_recommendation.get("enable_aq") or smart_recommendation.get("temporal_aq"):
+                aq_strength = smart_recommendation.get("aq_strength", self.settings.get_setting('nvenc_aq_strength'))
+                stream_args += [f'-aq-strength:v:{stream_id}', str(int(aq_strength))]
+            if smart_recommendation.get("enable_aq"):
+                stream_args += ['-spatial-aq', '1']
+            if smart_recommendation.get("temporal_aq"):
+                stream_args += ['-temporal-aq', '1']
+
+            logger.info(
+                "Smart output target applied (goal=%s, rc=%s, preset=%s, target=%sx%s, cap=%s, confidence=%s)",
+                smart_recommendation.get("goal"),
+                smart_recommendation.get("rc_mode"),
+                smart_recommendation.get("preset"),
+                smart_recommendation.get("target_resolution", {}).get("width"),
+                smart_recommendation.get("target_resolution", {}).get("height"),
+                smart_recommendation.get("target_cap"),
+                smart_recommendation.get("confidence"),
+            )
+
+        return stream_args
 
     def _map_pix_fmt(self, is_h264: bool, is_10bit: bool) -> str:
         if is_10bit and not is_h264:
@@ -227,7 +291,7 @@ class NvencEncoder(Encoder):
         provides = self.provides()
         return provides.get(encoder, {})
 
-    def stream_args(self, stream_info, stream_id, encoder_name):
+    def stream_args(self, stream_info, stream_id, encoder_name, filter_state=None):
         generic_kwargs = {}
         advanced_kwargs = {}
         encoder_args = []
@@ -259,7 +323,18 @@ class NvencEncoder(Encoder):
                 for k, v in target_color_config.get('stream_color_params', {}).items():
                     stream_args += [k, v]
 
-            stream_args += ['-preset', str(defaults.get('nvenc_preset'))]
+            smart_stream_args = []
+            smart_goal_enabled = (
+                self.settings.get_setting('enable_smart_output_target') and
+                filter_state and filter_state.get("execution_stage")
+            )
+            if smart_goal_enabled and self.probe:
+                smart_stream_args = self._smart_basic_stream_args(defaults, stream_id, filter_state)
+
+            if smart_stream_args:
+                stream_args += smart_stream_args
+            else:
+                stream_args += ['-preset', str(defaults.get('nvenc_preset'))]
 
             return {
                 "generic_kwargs":  generic_kwargs,

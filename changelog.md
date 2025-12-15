@@ -1,3 +1,7 @@
+**<span style="color:#56adda">0.1.14</span>**
+- Enable smart filters and resolution scaling in basic mode (works only with NVENC at this stage)
+- Added new smart output target controls to basic mode, including goal presets (Prefer Quality/Balanced/Prefer Compression)
+
 **<span style="color:#56adda">0.1.13</span>**
 - Fix bug where intermittently HW accelerated config was reverted to CPU encoding on its own
 

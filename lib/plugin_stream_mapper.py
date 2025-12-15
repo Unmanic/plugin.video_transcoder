@@ -43,6 +43,7 @@ class PluginStreamMapper(StreamMapper):
         self.complex_video_filters = {}
         self.crop_value = None
         self.forced_encode = False
+        self.execution_stage = False
 
     def set_default_values(self, settings, abspath, probe):
         """
@@ -53,6 +54,8 @@ class PluginStreamMapper(StreamMapper):
         :param probe:
         :return:
         """
+        # Reset execution stage for new files
+        self.execution_stage = False
         self.abspath = abspath
         # Set the file probe data
         self.set_probe(probe)
@@ -100,6 +103,16 @@ class PluginStreamMapper(StreamMapper):
             self.set_ffmpeg_generic_options(**generic_kwargs)
             self.set_ffmpeg_advanced_options(**advanced_kwargs)
 
+    def enable_execution_stage(self):
+        """
+        Mark mapper to rebuild stream args for execution (not lightweight checks).
+        """
+        self.execution_stage = True
+        # Reset cached mappings to rebuild with execution-stage logic
+        self.stream_mapping = []
+        self.stream_encoding = []
+        self.complex_video_filters = {}
+
     def scale_resolution(self, stream_info: dict):
         def get_test_resolution(settings):
             target_resolution = settings.get_setting('target_resolution')
@@ -145,6 +158,17 @@ class PluginStreamMapper(StreamMapper):
         software_filters = []
         hardware_filters = []
         filter_args = []
+        source_width = stream_info.get('width', stream_info.get('coded_width', 0))
+        source_height = stream_info.get('height', stream_info.get('coded_height', 0))
+        filter_state = {
+            "source_width":  source_width,
+            "source_height": source_height,
+            "target_width":  source_width,
+            "target_height": source_height,
+            "scale_applied": False,
+            "crop_applied":  False,
+            "execution_stage": self.execution_stage,
+        }
 
         # Get configured encoder name
         encoder_name = self.settings.get_setting('video_encoder')
@@ -171,6 +195,14 @@ class PluginStreamMapper(StreamMapper):
             if self.settings.get_setting('autocrop_black_bars') and self.crop_value:
                 # Note: There is no good way to crop with HW filters at this time. For now, lets leave this as a SW filter.
                 filter_args.append(f"crop={self.crop_value}")
+                try:
+                    crop_w, crop_h, _, _ = [int(x) for x in self.crop_value.split(':')]
+                    if crop_w > 0 and crop_h > 0:
+                        filter_state["crop_applied"] = True
+                        filter_state["target_width"] = crop_w
+                        filter_state["target_height"] = crop_h
+                except (ValueError, AttributeError):
+                    pass
             if self.settings.get_setting('target_resolution') not in ['source']:
                 vid_width, vid_height = self.scale_resolution(stream_info)
                 if vid_height:
@@ -183,6 +215,14 @@ class PluginStreamMapper(StreamMapper):
                             "values": {"width": vid_width, "height": vid_height}
                         },
                     })
+                    filter_state["scale_applied"] = True
+                    current_width = filter_state.get("target_width") or source_width or 1
+                    current_height = filter_state.get("target_height") or source_height or 1
+                    filter_state["target_width"] = vid_width
+                    try:
+                        filter_state["target_height"] = int(round(current_height * (vid_width / current_width)))
+                    except ZeroDivisionError:
+                        filter_state["target_height"] = vid_height
 
         # Apply custom filtergraph logic from encoder libraries
         filtergraph_config = {}
@@ -217,13 +257,15 @@ class PluginStreamMapper(StreamMapper):
 
         # Return here if there are no filters to apply
         if not filter_args:
-            return None, None
+            self.complex_video_filters[stream_id] = filter_state
+            return None, None, filter_state
 
         # Join filtergraph
         filter_id = '0:v:{}'.format(stream_id)
         filter_id, filtergraph = tools.join_filtergraph(filter_id, filter_args, stream_id)
 
-        return filter_id, filtergraph
+        self.complex_video_filters[stream_id] = filter_state
+        return filter_id, filtergraph, filter_state
 
     def test_stream_needs_processing(self, stream_info: dict):
         """
@@ -301,10 +343,20 @@ class PluginStreamMapper(StreamMapper):
             else:
 
                 # Build complex filter
-                filter_id, filter_complex = self.build_filter_chain(stream_info, stream_id)
+                filter_id, filter_complex, filter_state = self.build_filter_chain(stream_info, stream_id)
                 if filter_complex:
                     map_identifier = '[{}]'.format(filter_id)
                     self.set_ffmpeg_advanced_options(**{"-filter_complex": filter_complex})
+                else:
+                    filter_state = self.complex_video_filters.get(stream_id, {
+                        "source_width":  stream_info.get('width', stream_info.get('coded_width', 0)),
+                        "source_height": stream_info.get('height', stream_info.get('coded_height', 0)),
+                        "target_width":  stream_info.get('width', stream_info.get('coded_width', 0)),
+                        "target_height": stream_info.get('height', stream_info.get('coded_height', 0)),
+                        "scale_applied": False,
+                        "crop_applied":  False,
+                        "execution_stage": self.execution_stage,
+                    })
 
                 stream_encoding = [
                     '-c:{}'.format(stream_specifier), encoder_name,
@@ -319,23 +371,23 @@ class PluginStreamMapper(StreamMapper):
 
                 # Add encoder args
                 if encoder_name in libx_encoder.provides():
-                    stream_args = libx_encoder.stream_args(stream_info, stream_id, encoder_name)
+                    stream_args = libx_encoder.stream_args(stream_info, stream_id, encoder_name, filter_state=filter_state)
                     stream_encoding += stream_args.get("encoder_args", [])
                     stream_encoding += stream_args.get("stream_args", [])
                 elif encoder_name in stva1_encoder.provides():
-                    stream_args = vaapi_encoder.stream_args(stream_info, stream_id, encoder_name)
+                    stream_args = vaapi_encoder.stream_args(stream_info, stream_id, encoder_name, filter_state=filter_state)
                     stream_encoding += stream_args.get("encoder_args", [])
                     stream_encoding += stream_args.get("stream_args", [])
                 elif encoder_name in qsv_encoder.provides():
-                    stream_args = qsv_encoder.stream_args(stream_info, stream_id, encoder_name)
+                    stream_args = qsv_encoder.stream_args(stream_info, stream_id, encoder_name, filter_state=filter_state)
                     stream_encoding += stream_args.get("encoder_args", [])
                     stream_encoding += stream_args.get("stream_args", [])
                 elif encoder_name in vaapi_encoder.provides():
-                    stream_args = vaapi_encoder.stream_args(stream_info, stream_id, encoder_name)
+                    stream_args = vaapi_encoder.stream_args(stream_info, stream_id, encoder_name, filter_state=filter_state)
                     stream_encoding += stream_args.get("encoder_args", [])
                     stream_encoding += stream_args.get("stream_args", [])
                 elif encoder_name in nvenc_encoder.provides():
-                    stream_args = nvenc_encoder.stream_args(stream_info, stream_id, encoder_name)
+                    stream_args = nvenc_encoder.stream_args(stream_info, stream_id, encoder_name, filter_state=filter_state)
                     stream_encoding += stream_args.get("encoder_args", [])
                     stream_encoding += stream_args.get("stream_args", [])
                     self.set_ffmpeg_generic_options(**stream_args.get("generic_kwargs", {}))
