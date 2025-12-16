@@ -27,16 +27,18 @@ Notes:
         ffmpeg -h encoder=h264_nvenc
         ffmpeg -h encoder=hevc_nvenc
 """
-import logging
 import re
+import logging
 import subprocess
-
-from video_transcoder.lib.encoders.base import Encoder
+from functools import lru_cache
 from video_transcoder.lib.smart_output_target import SmartOutputTargetHelper
+from video_transcoder.lib.encoders.base import Encoder
+
 
 logger = logging.getLogger("Unmanic.Plugin.video_transcoder")
 
 
+@lru_cache(maxsize=1)
 def list_available_cuda_devices():
     """
     Return a list of available CUDA devices via nvidia-smi.
@@ -44,7 +46,9 @@ def list_available_cuda_devices():
     gpu_dicts = []
     try:
         # Run the nvidia-smi command
-        result = subprocess.check_output(['nvidia-smi', '-L'], encoding='utf-8')
+        result = subprocess.check_output(['nvidia-smi', '-L'], encoding='utf-8', timeout=2)
+        if not result:
+            raise ValueError("Failed to fetch available cuda devices")
         # Use regular expression to find device IDs, names, and UUIDs
         gpu_info = re.findall(r'GPU (\d+): (.+) \(UUID: (.+)\)', result)
         # Populate the list of dictionaries for each GPU
@@ -53,14 +57,73 @@ def list_available_cuda_devices():
                 'hwaccel_device':      gpu_id,
                 'hwaccel_device_name': f"{gpu_name} (UUID: {gpu_uuid})",
             })
-    except FileNotFoundError:
-        # nvidia-smi executable not found
-        return []
-    except subprocess.CalledProcessError:
-        # nvidia-smi command failed, likely no NVIDIA GPU present
-        return []
-    # Return the list of GPUs
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        # nvidia-smi executable not found or command failed
+        raise ValueError("Failed to fetch available cuda devices")
+    except ValueError:
+        raise
+
     return gpu_dicts
+
+
+@lru_cache(maxsize=1)
+def _max_compute_capability():
+    """
+    Try to read the highest compute capability reported by nvidia-smi.
+    """
+    queries = [
+        ['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
+        ['nvidia-smi', '--query-gpu=compute_capability', '--format=csv,noheader'],
+    ]
+    for cmd in queries:
+        try:
+            result = subprocess.check_output(cmd, encoding='utf-8', timeout=2)
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            continue
+        if not result:
+            continue
+        caps = []
+        for line in result.splitlines():
+            cap_str = line.strip()
+            if not cap_str:
+                continue
+            try:
+                caps.append(float(cap_str))
+            except ValueError:
+                continue
+        if caps:
+            return max(caps)
+    raise ValueError("Failed to fetch compute capability via nvidia-smi")
+
+
+def is_pascal_or_newer():
+    """
+    Detect whether the available GPU(s) meet Pascal (6.x) compute capability or newer.
+    Returns:
+        True if Pascal+, False if definitively older, None if unknown.
+    """
+    try:
+        max_capability = _max_compute_capability()
+    except ValueError:
+        return None
+    if max_capability is None:
+        return None
+    return max_capability >= 6.0
+
+
+def is_turing_or_newer():
+    """
+    Detect whether the available GPU(s) meet Turing (7.5) compute capability or newer.
+    Returns:
+        True if Turing+, False if definitively older, None if unknown.
+    """
+    try:
+        max_capability = _max_compute_capability()
+    except ValueError:
+        return None
+    if max_capability is None:
+        return None
+    return max_capability >= 7.5
 
 
 def get_configured_device(settings):
@@ -72,7 +135,10 @@ def get_configured_device(settings):
     """
     hardware_device = None
     # Set the hardware device
-    hardware_devices = list_available_cuda_devices()
+    try:
+        hardware_devices = list_available_cuda_devices()
+    except ValueError:
+        hardware_devices = []
     if not hardware_devices:
         # Return no options. No hardware device was found
         raise Exception("No NVIDIA device found")
@@ -93,14 +159,15 @@ class NvencEncoder(Encoder):
     def __init__(self, settings=None, probe=None):
         super().__init__(settings=settings, probe=probe)
 
-    def _smart_basic_stream_args(self, defaults, stream_id, filter_state):
+    def _smart_basic_stream_args(self, defaults, stream_id, filter_state, target_encoder):
         """
         Build smart output target args for basic mode, returning the stream args list.
         """
         stream_args = []
         smart_recommendation = None
+        provides = self.provides()
         try:
-            helper = SmartOutputTargetHelper(self.probe, logger_override=logger)
+            helper = SmartOutputTargetHelper(self.probe)
             file_path = None
             try:
                 file_path = (self.probe.get_probe() or {}).get("format", {}).get("filename")
@@ -114,12 +181,19 @@ class NvencEncoder(Encoder):
             }
             source_stats = helper.collect_source_stats(file_path=file_path)
             goal = self.settings.get_setting('smart_output_target')
-            smart_recommendation = helper.recommend_params(goal, source_stats, target_filters)
+            target_codec = provides.get(target_encoder, {}).get('codec', 'h264')
+            smart_recommendation = helper.recommend_params(
+                goal,
+                source_stats,
+                target_filters,
+                target_codec,
+                target_encoder,
+            )
         except Exception as exc:
             logger.info("Smart output target unavailable, falling back to defaults: %s", exc)
 
         if smart_recommendation:
-            preset_value = smart_recommendation.get("preset", defaults.get('nvenc_preset'))
+            preset_value = "p7"
             stream_args += ['-preset', str(preset_value)]
 
             rc_mode = smart_recommendation.get("rc_mode")
@@ -129,25 +203,37 @@ class NvencEncoder(Encoder):
                 stream_args += [f'-qp:v:{stream_id}', str(int(smart_recommendation.get("qp")))]
             if smart_recommendation.get("cq") is not None:
                 stream_args += [f'-cq:v:{stream_id}', str(int(smart_recommendation.get("cq")))]
+                if rc_mode == "vbr":
+                    # NVENC VBR target-quality mode still expects an average bitrate; set 0 so maxrate is the only rail.
+                    stream_args += [f'-b:v:{stream_id}', '0']
             if smart_recommendation.get("maxrate"):
                 stream_args += [f'-maxrate:v:{stream_id}', str(int(smart_recommendation.get("maxrate")))]
             if smart_recommendation.get("bufsize"):
                 stream_args += [f'-bufsize:v:{stream_id}', str(int(smart_recommendation.get("bufsize")))]
             if smart_recommendation.get("lookahead"):
                 stream_args += [f'-rc-lookahead:v:{stream_id}', str(int(smart_recommendation.get("lookahead")))]
-            if smart_recommendation.get("enable_aq") or smart_recommendation.get("temporal_aq"):
+
+            aq_requested = smart_recommendation.get("enable_aq") or smart_recommendation.get("temporal_aq")
+            aq_supported = is_pascal_or_newer()
+            if aq_requested and aq_supported is False:
+                logger.info("Skipping NVENC AQ because GPU compute capability is older than Pascal.")
+            elif aq_requested:
                 aq_strength = smart_recommendation.get("aq_strength", self.settings.get_setting('nvenc_aq_strength'))
                 stream_args += [f'-aq-strength:v:{stream_id}', str(int(aq_strength))]
-            if smart_recommendation.get("enable_aq"):
-                stream_args += ['-spatial-aq', '1']
-            if smart_recommendation.get("temporal_aq"):
-                stream_args += ['-temporal-aq', '1']
+                if smart_recommendation.get("enable_aq"):
+                    stream_args += [f'-spatial-aq:v:{stream_id}', '1']
+                if smart_recommendation.get("temporal_aq") and is_turing_or_newer():
+                    stream_args += [f'-temporal-aq:v:{stream_id}', '1']
+                elif smart_recommendation.get("temporal_aq"):
+                    logger.info("Skipping NVENC temporal AQ because GPU compute capability is older than Turing.")
+                if aq_supported is None:
+                    logger.info("Applied NVENC AQ without compute capability data; GPU support unknown.")
 
             logger.info(
                 "Smart output target applied (goal=%s, rc=%s, preset=%s, target=%sx%s, cap=%s, confidence=%s)",
                 smart_recommendation.get("goal"),
                 smart_recommendation.get("rc_mode"),
-                smart_recommendation.get("preset"),
+                preset_value,
                 smart_recommendation.get("target_resolution", {}).get("width"),
                 smart_recommendation.get("target_resolution", {}).get("height"),
                 smart_recommendation.get("target_cap"),
@@ -284,7 +370,10 @@ class NvencEncoder(Encoder):
         }
 
     def encoder_details(self, encoder):
-        hardware_devices = list_available_cuda_devices()
+        try:
+            hardware_devices = list_available_cuda_devices()
+        except ValueError:
+            hardware_devices = []
         if not hardware_devices:
             # Return no options. No hardware device was found
             return {}
@@ -329,10 +418,12 @@ class NvencEncoder(Encoder):
                 filter_state and filter_state.get("execution_stage")
             )
             if smart_goal_enabled and self.probe:
-                smart_stream_args = self._smart_basic_stream_args(defaults, stream_id, filter_state)
+                smart_stream_args = self._smart_basic_stream_args(defaults, stream_id, filter_state, encoder_name)
 
             if smart_stream_args:
                 stream_args += smart_stream_args
+            elif smart_goal_enabled:
+                stream_args += ['-preset', 'p7']
             else:
                 stream_args += ['-preset', str(defaults.get('nvenc_preset'))]
 
@@ -369,11 +460,11 @@ class NvencEncoder(Encoder):
 
         # Apply adaptive quantization
         if self.settings.get_setting('nvenc_enable_spatial_aq'):
-            stream_args += ['-spatial-aq', '1']
+            stream_args += [f'-spatial-aq:v:{stream_id}', '1']
         if self.settings.get_setting('nvenc_enable_spatial_aq') or self.settings.get_setting('nvenc_enable_temporal_aq'):
             stream_args += [f'-aq-strength:v:{stream_id}', str(self.settings.get_setting('nvenc_aq_strength'))]
         if self.settings.get_setting('nvenc_enable_temporal_aq'):
-            stream_args += ['-temporal-aq', '1']
+            stream_args += [f'-temporal-aq:v:{stream_id}', '1']
 
         # If CUVID is enabled, return generic_kwargs
         if (self.settings.get_setting('nvenc_decoding_method') or '').lower() in ['cuvid']:
@@ -411,7 +502,7 @@ class NvencEncoder(Encoder):
         if not getattr(self.settings, 'apply_default_fallbacks', True):
             return current_value
         if current_value not in available_options:
-            # Update in-memory setting for display only. 
+            # Update in-memory setting for display only.
             # IMPORTANT: do not persist settings from plugin.
             #   Only the Unmanic API calls should persist to JSON file.
             self.settings.settings_configured[key] = default_option
@@ -431,7 +522,10 @@ class NvencEncoder(Encoder):
             ]
         }
         default_option = None
-        hardware_devices = list_available_cuda_devices()
+        try:
+            hardware_devices = list_available_cuda_devices()
+        except ValueError:
+            hardware_devices = []
         if hardware_devices:
             values['select_options'] = []
             for hw_device in hardware_devices:
@@ -659,6 +753,10 @@ class NvencEncoder(Encoder):
                            "This helps in improving the quality of areas within a frame that are more detailed or complex.",
             "sub_setting": True,
         }
+        # Hide when hardware is definitively older than Pascal.
+        pascal_capable = is_pascal_or_newer()
+        if pascal_capable is False:
+            values["display"] = 'hidden'
         if self.settings.get_setting('mode') not in ['standard']:
             values["display"] = 'hidden'
         return values
@@ -671,6 +769,10 @@ class NvencEncoder(Encoder):
                            "This option requires Turing or newer hardware.",
             "sub_setting": True,
         }
+        # Hide when hardware is definitively older than Turing.
+        turing_capable = is_turing_or_newer()
+        if turing_capable is False:
+            values["display"] = 'hidden'
         if self.settings.get_setting('mode') not in ['standard']:
             values["display"] = 'hidden'
         return values
