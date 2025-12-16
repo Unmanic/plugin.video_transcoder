@@ -126,7 +126,65 @@ def is_turing_or_newer():
     return max_capability >= 7.5
 
 
-def get_configured_device(settings):
+@lru_cache(maxsize=None)
+def _supports_temporal_aq(encoder_name, hw_device):
+    """
+    Detect whether NVENC temporal AQ is supported by the configured GPU/driver for a specific encoder.
+    Returns:
+        True if supported, False if definitively unsupported, None if unknown.
+    """
+    if not encoder_name:
+        return None
+    # Normalize cache key inputs (lru_cache uses args).
+    device_idx = None if hw_device in (None, 'none') else str(hw_device)
+    cmd = [
+        'ffmpeg',
+        '-v', 'info',
+        '-nostdin',
+        '-f', 'lavfi',
+        '-i', 'testsrc=size=320x240:rate=1:duration=1',
+        '-frames:v', '1',
+        '-c:v', str(encoder_name),
+    ]
+    if device_idx is not None:
+        cmd += ['-gpu', device_idx]
+    cmd += ['-temporal-aq', '1', '-f', 'null', '-']
+
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=4)
+        return True
+    except FileNotFoundError:
+        logger.info("ffmpeg not found while probing NVENC temporal AQ support.")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.info("Timed out while probing NVENC temporal AQ support.")
+        return None
+    except subprocess.CalledProcessError as exc:
+        output = exc.output or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors='ignore')
+        output_lower = output.lower()
+        failure_markers = (
+            "does not support temporal",
+            "temporal aq not supported",
+            "temporal aq: not supported",
+            "temporal aq not supported for this encoder",
+            "invalid param",
+            "unsupported parameter",
+            "unrecognized option 'temporal-aq'",
+        )
+        if any(marker in output_lower for marker in failure_markers):
+            return False
+        if "no nvenc capable devices" in output_lower or "no capable devices found" in output_lower:
+            return None
+        logger.info(
+            "NVENC temporal AQ probe failed; treating as unsupported. Output: %s",
+            output.strip(),
+        )
+        return False
+
+
+def get_configured_device_info(settings):
     """
     Returns the currently configured device
     Checks to ensure that the configured device exists and otherwise will return the first device available
@@ -159,7 +217,7 @@ class NvencEncoder(Encoder):
     def __init__(self, settings=None, probe=None):
         super().__init__(settings=settings, probe=probe)
 
-    def _smart_basic_stream_args(self, defaults, stream_id, filter_state, target_encoder):
+    def _smart_basic_stream_args(self, stream_id, filter_state, target_encoder, hardware_device):
         """
         Build smart output target args for basic mode, returning the stream args list.
         """
@@ -182,12 +240,14 @@ class NvencEncoder(Encoder):
             source_stats = helper.collect_source_stats(file_path=file_path)
             goal = self.settings.get_setting('smart_output_target')
             target_codec = provides.get(target_encoder, {}).get('codec', 'h264')
+            target_supports_hdr10 = target_encoder in ("hevc_nvenc",)
             smart_recommendation = helper.recommend_params(
                 goal,
                 source_stats,
                 target_filters,
                 target_codec,
                 target_encoder,
+                target_supports_hdr10,
             )
         except Exception as exc:
             logger.info("Smart output target unavailable, falling back to defaults: %s", exc)
@@ -196,43 +256,45 @@ class NvencEncoder(Encoder):
             preset_value = "p7"
             stream_args += ['-preset', str(preset_value)]
 
-            rc_mode = smart_recommendation.get("rc_mode")
-            if rc_mode:
-                stream_args += [f'-rc:v:{stream_id}', str(rc_mode)]
-            if smart_recommendation.get("qp") is not None:
-                stream_args += [f'-qp:v:{stream_id}', str(int(smart_recommendation.get("qp")))]
-            if smart_recommendation.get("cq") is not None:
-                stream_args += [f'-cq:v:{stream_id}', str(int(smart_recommendation.get("cq")))]
-                if rc_mode == "vbr":
+            quality_mode = smart_recommendation.get("quality_mode")
+            quality_index = smart_recommendation.get("quality_index")
+            wants_cap = smart_recommendation.get("wants_cap")
+            rc_mode = "constqp" if quality_mode == SmartOutputTargetHelper.QUALITY_CONST else "vbr"
+            if rc_mode == "constqp" and wants_cap:
+                rc_mode = "vbr"
+            stream_args += [f'-rc:v:{stream_id}', rc_mode]
+
+            if rc_mode == "constqp":
+                if quality_index is not None:
+                    stream_args += [f'-qp:v:{stream_id}', str(int(quality_index))]
+            else:
+                if quality_index is not None:
+                    stream_args += [f'-cq:v:{stream_id}', str(int(quality_index))]
                     # NVENC VBR target-quality mode still expects an average bitrate; set 0 so maxrate is the only rail.
                     stream_args += [f'-b:v:{stream_id}', '0']
-            if smart_recommendation.get("maxrate"):
-                stream_args += [f'-maxrate:v:{stream_id}', str(int(smart_recommendation.get("maxrate")))]
-            if smart_recommendation.get("bufsize"):
-                stream_args += [f'-bufsize:v:{stream_id}', str(int(smart_recommendation.get("bufsize")))]
-            if smart_recommendation.get("lookahead"):
-                stream_args += [f'-rc-lookahead:v:{stream_id}', str(int(smart_recommendation.get("lookahead")))]
+                maxrate = smart_recommendation.get("maxrate")
+                bufsize = smart_recommendation.get("bufsize")
+                if maxrate:
+                    stream_args += [f'-maxrate:v:{stream_id}', str(int(maxrate))]
+                if bufsize:
+                    stream_args += [f'-bufsize:v:{stream_id}', str(int(bufsize))]
 
-            aq_requested = smart_recommendation.get("enable_aq") or smart_recommendation.get("temporal_aq")
-            aq_supported = is_pascal_or_newer()
-            if aq_requested and aq_supported is False:
-                logger.info("Skipping NVENC AQ because GPU compute capability is older than Pascal.")
-            elif aq_requested:
-                aq_strength = smart_recommendation.get("aq_strength", self.settings.get_setting('nvenc_aq_strength'))
-                stream_args += [f'-aq-strength:v:{stream_id}', str(int(aq_strength))]
-                if smart_recommendation.get("enable_aq"):
-                    stream_args += [f'-spatial-aq:v:{stream_id}', '1']
-                if smart_recommendation.get("temporal_aq") and is_turing_or_newer():
+            # Apply fixed lookahead/AQ defaults in encoder layer.
+            if rc_mode == "vbr":
+                stream_args += [f'-rc-lookahead:v:{stream_id}', '12']
+
+            if is_pascal_or_newer():
+                stream_args += [f'-aq-strength:v:{stream_id}', '8']
+                stream_args += [f'-spatial-aq:v:{stream_id}', '1']
+                if _supports_temporal_aq(target_encoder, hardware_device.get('hwaccel_device', 0)):
                     stream_args += [f'-temporal-aq:v:{stream_id}', '1']
-                elif smart_recommendation.get("temporal_aq"):
-                    logger.info("Skipping NVENC temporal AQ because GPU compute capability is older than Turing.")
-                if aq_supported is None:
-                    logger.info("Applied NVENC AQ without compute capability data; GPU support unknown.")
+            else:
+                logger.info("Skipping NVENC AQ because GPU compute capability is older than Pascal or indeterminate.")
 
             logger.info(
-                "Smart output target applied (goal=%s, rc=%s, preset=%s, target=%sx%s, cap=%s, confidence=%s)",
+                "Smart output target applied (goal=%s, mode=%s, preset=%s, target=%sx%s, cap=%s, confidence=%s)",
                 smart_recommendation.get("goal"),
-                smart_recommendation.get("rc_mode"),
+                smart_recommendation.get("quality_mode"),
                 preset_value,
                 smart_recommendation.get("target_resolution", {}).get("width"),
                 smart_recommendation.get("target_resolution", {}).get("height"),
@@ -283,14 +345,14 @@ class NvencEncoder(Encoder):
 
         :return:
         """
-        hardware_device = get_configured_device(self.settings)
+        hardware_device = get_configured_device_info(self.settings)
 
         generic_kwargs = {}
         advanced_kwargs = {}
         # Check if we are using a HW accelerated decoder also
         if self.settings.get_setting('nvenc_decoding_method') in ['cuda', 'nvdec', 'cuvid']:
             generic_kwargs = {
-                "-hwaccel_device":   hardware_device.get('hwaccel_device'),
+                "-hwaccel_device":   hardware_device.get('hwaccel_device', 0),
                 "-hwaccel":          self.settings.get_setting('nvenc_decoding_method'),
                 "-init_hw_device":   "cuda=hw",
                 "-filter_hw_device": "hw",
@@ -387,7 +449,7 @@ class NvencEncoder(Encoder):
         stream_args = []
 
         # Specify the GPU to use for encoding
-        hardware_device = get_configured_device(self.settings)
+        hardware_device = get_configured_device_info(self.settings)
         stream_args += ['-gpu', str(hardware_device.get('hwaccel_device', '0'))]
 
         # Handle HDR
@@ -418,7 +480,12 @@ class NvencEncoder(Encoder):
                 filter_state and filter_state.get("execution_stage")
             )
             if smart_goal_enabled and self.probe:
-                smart_stream_args = self._smart_basic_stream_args(defaults, stream_id, filter_state, encoder_name)
+                smart_stream_args = self._smart_basic_stream_args(
+                    stream_id,
+                    filter_state,
+                    encoder_name,
+                    hardware_device,
+                )
 
             if smart_stream_args:
                 stream_args += smart_stream_args
@@ -464,6 +531,9 @@ class NvencEncoder(Encoder):
         if self.settings.get_setting('nvenc_enable_spatial_aq') or self.settings.get_setting('nvenc_enable_temporal_aq'):
             stream_args += [f'-aq-strength:v:{stream_id}', str(self.settings.get_setting('nvenc_aq_strength'))]
         if self.settings.get_setting('nvenc_enable_temporal_aq'):
+            temporal_aq_supported = _supports_temporal_aq(encoder_name, hardware_device.get('hwaccel_device', 0))
+            if not temporal_aq_supported:
+                logger.info("NVENC temporal AQ is configured, but this GPU does not appear to support it. This will likely fail.")
             stream_args += [f'-temporal-aq:v:{stream_id}', '1']
 
         # If CUVID is enabled, return generic_kwargs
@@ -766,10 +836,11 @@ class NvencEncoder(Encoder):
             "label":       "Enable Temporal Adaptive Quantization",
             "description": "This adjusts the quantization parameter across frames, based on the motion and temporal complexity.\n"
                            "This is particularly effective in scenes with varying levels of motion, enhancing quality where it's most needed.\n"
-                           "This option requires Turing or newer hardware.",
+                           "Support depends on the encoder/GPU combination. Ensure that your GPU supports this (Eg. at least Turing or newer hardware. Not a TU117 processor. Etc.).",
             "sub_setting": True,
         }
         # Hide when hardware is definitively older than Turing.
+        # TODO: This changes depending on the encoder and hardware. Update this to use _supports_temporal_aq to detect if the GPU can use Temporal AQ.
         turing_capable = is_turing_or_newer()
         if turing_capable is False:
             values["display"] = 'hidden'
@@ -793,6 +864,9 @@ class NvencEncoder(Encoder):
         }
         if self.settings.get_setting('mode') not in ['standard']:
             values["display"] = "hidden"
-        if not self.settings.get_setting('nvenc_enable_spatial_aq'):
+        if (
+            not self.settings.get_setting('nvenc_enable_spatial_aq') and
+            not self.settings.get_setting('nvenc_enable_temporal_aq')
+        ):
             values["display"] = "hidden"
         return values

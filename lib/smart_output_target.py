@@ -60,6 +60,10 @@ class SmartOutputTargetHelper:
     GOAL_BALANCED = "balanced"
     GOAL_PREFER_COMPRESSION = "prefer_compression"
 
+    QUALITY_CONST = "const_quality"
+    QUALITY_CAPPED = "capped_quality"
+    QUALITY_TARGET = "target_bitrate"
+
     _GOALS = {GOAL_PREFER_QUALITY, GOAL_BALANCED, GOAL_PREFER_COMPRESSION}
 
     # This table provides a selection of factors for each goal that modifies how aggressively to cap bitrate.
@@ -91,7 +95,7 @@ class SmartOutputTargetHelper:
     # This table provides CQ ladders keyed by codec -> goal -> dynamic range -> resolution bucket.
     # Codec nudges the ladder based on encoder behaviour (hevc/h264/av1); goal balances size vs fidelity;
     # HDR entries lower CQ to reduce banding risk; sd/hd/uhd buckets scale quantisers with detail expectations.
-    _BASE_CQ_LADDERS = {
+    _BASE_QUALITY_LADDERS = {
         "hevc": {
             GOAL_PREFER_COMPRESSION: {
                 "sdr": {"sd": 27, "hd": 28, "uhd": 29},
@@ -311,6 +315,8 @@ class SmartOutputTargetHelper:
         # Bit depth (note: ensure _bit_depth_from_pix_fmt is correct; yuv420p10le should become 10)
         pix_fmt = first_video.get("pix_fmt")
         bit_depth = self._safe_int(first_video.get("bits_per_raw_sample")) or self._bit_depth_from_pix_fmt(pix_fmt)
+        if bit_depth is None and pix_fmt:
+            bit_depth = 8
 
         confidence = confidence_level != "low"
 
@@ -368,32 +374,41 @@ class SmartOutputTargetHelper:
     def _clamp(self, value: float, min_value: float, max_value: float) -> float:
         return max(min_value, min(value, max_value))
 
-    def _target_cap(self, goal: str, source_bitrate: Optional[int], pixel_ratio: float, resolution_bucket: str, is_hdr: bool):
+    def _target_cap(
+        self,
+        goal: str,
+        source_bitrate: Optional[int],
+        pixel_ratio: float,
+        is_hdr: bool,
+        apply_floor: bool,
+        floor_br: int,
+    ):
         """
         Guardrail: cap bitrate relative to source, scaled by pixel ratio.
         """
         if not source_bitrate:
-            return None
+            return int(floor_br) if apply_floor and floor_br else None
         cap_factor = self._CAP_FACTORS.get(goal, 1.1)
         if is_hdr and goal != self.GOAL_PREFER_QUALITY:
             cap_factor += 0.05
-        floor_br = self._floor_bitrate(goal, resolution_bucket)
         base_cap = source_bitrate * pixel_ratio
         same_res_cap = source_bitrate * 1.05
         upper_cap = source_bitrate if pixel_ratio < 1 else source_bitrate * 1.05
         target_cap = (base_cap if pixel_ratio < 1 else same_res_cap) * cap_factor
-        min_cap = min(floor_br, upper_cap)
-        return int(self._clamp(target_cap, min_cap, upper_cap))
+        candidate = target_cap
+        if apply_floor and floor_br:
+            candidate = max(candidate, floor_br)
+        return int(self._clamp(candidate, 0, upper_cap))
 
     # --------------------------
     # Recommendation assembly
     # --------------------------
-    def _base_cq_for_codec(self, target_codec: str, goal: str, is_hdr: bool, resolution_bucket: str) -> Optional[int]:
+    def _base_quality_index(self, target_codec: str, goal: str, is_hdr: bool, resolution_bucket: str) -> Optional[int]:
         """
-        CQ ladders are per encoder/codec, with HDR slightly more conservative.
+        Quality ladders are per codec, with HDR slightly more conservative.
         """
         target_codec = (target_codec or "").lower()
-        codec_table = self._BASE_CQ_LADDERS.get(target_codec) or self._BASE_CQ_LADDERS.get("hevc")
+        codec_table = self._BASE_QUALITY_LADDERS.get(target_codec) or self._BASE_QUALITY_LADDERS.get("hevc")
         goal_table = codec_table.get(goal)
         if not goal_table:
             return None
@@ -409,16 +424,20 @@ class SmartOutputTargetHelper:
         dst = (target_codec or "").lower()
         return self._REENCODE_CQ_OFFSETS.get((src, dst), 0)
 
-    def recommend_params(self, goal: str, source_stats: SourceStats, target_filters: Dict, target_codec: str, target_encoder: str):
+    def recommend_params(
+        self,
+        goal: str,
+        source_stats: SourceStats,
+        target_filters: Dict,
+        target_codec: str,
+        target_encoder: str,
+        target_supports_hdr10: bool,
+    ):
         """
-        Build a minimal, easy-to-tune recommendation dict.
-
-        Steps:
-            1) Normalise goal/targets.
-            2) Compute caps relative to source + scale.
-            3) Pick a baseline profile per goal.
-            4) Apply guardrails (low bitrate downscale -> VBR).
-            5) Tweak AQ/lookahead when confidence is low.
+        Build encoder-agnostic recommendations:
+            - quality_mode: const_quality / capped_quality / target_bitrate
+            - quality_index: abstract quantiser step (ladder entry)
+            - wants_cap: desire to apply a bitrate rail
         """
         goal = goal or self.GOAL_BALANCED
         goal = goal if goal in self._GOALS else self.GOAL_BALANCED
@@ -429,7 +448,8 @@ class SmartOutputTargetHelper:
         source_height = max(source_stats.height, 1)
 
         pixel_ratio = (target_width * target_height) / float(source_width * source_height)
-        resolution_bucket = self._resolution_bucket(target_width, target_height)
+        target_bucket = self._resolution_bucket(target_width, target_height)
+        source_bucket = self._resolution_bucket(source_width, source_height)
         source_bitrate = source_stats.derived_bitrate
         target_codec = (target_codec or "").lower()
         target_encoder = (target_encoder or "").lower()
@@ -445,151 +465,141 @@ class SmartOutputTargetHelper:
             pixel_ratio,
         )
 
-        # Guardrail cap:
-        #   Scale relative to source bitrate and pixel ratio (downscales should not exceed source-per-pixel bitrate).
-        target_cap = self._target_cap(goal, source_bitrate, pixel_ratio, resolution_bucket, source_stats.is_hdr)
-        downgraded_to_vbr = False
+        # Bitrate cap guardrail:
+        #   Scale relative to the source and the pixel ratio.
+        #   This only applies a floor when bitrate is unknown or when we are not downscaling.
+        apply_floor = (source_bitrate is None) or pixel_ratio >= 1
+        floor_br = self._floor_bitrate(goal, target_bucket)
+        target_cap = self._target_cap(
+            goal,
+            source_bitrate,
+            pixel_ratio,
+            source_stats.is_hdr,
+            apply_floor,
+            floor_br,
+        )
 
-        # Rate control mode:
-        #   Default Prefer Quality to constqp (no bitrate cap), but switch to VBR if downscaling a low-bitrate source.
-        #   Why: constqp on already-starved inputs can blow up bitrate when scaling down; CQ-VBR with caps protects size.
-        rc_mode = "constqp" if goal == self.GOAL_PREFER_QUALITY else "vbr"
+        # Downscale guardrail for low-bitrate sources:
+        #   When Prefer Quality is downscaling a weak source, switch to capped mode to avoid runaway constqp.
+        low_bitrate_threshold = self._LOW_BITRATE_THRESHOLDS.get(source_bucket, 0)
 
-        # Low bitrate + downscale guardrail:
-        #   If the source is already low bitrate and we’re downscaling, Prefer Quality falls back to CQ-VBR to avoid
-        #   runaway bitrate from constqp while still respecting a cap based on the source and pixel ratio.
-        low_bitrate_threshold = self._LOW_BITRATE_THRESHOLDS.get(resolution_bucket, 0)
-        if goal == self.GOAL_PREFER_QUALITY and pixel_ratio < 1 and source_bitrate and source_bitrate <= low_bitrate_threshold:
-            rc_mode = "vbr"
-            downgraded_to_vbr = True
+        # Pick quality mode/index and record any downgrade reason.
+        quality_mode = self.QUALITY_CONST if goal == self.GOAL_PREFER_QUALITY else self.QUALITY_CAPPED
+        downgraded_reason = None
+        if (
+            quality_mode == self.QUALITY_CONST
+            and pixel_ratio < 1
+            and source_bitrate
+            and source_bitrate <= low_bitrate_threshold
+        ):
+            quality_mode = self.QUALITY_CAPPED
+            downgraded_reason = "low_bitrate_downscale"
 
         # HDR handling guardrails:
-        #   - hdr_output_limited: HDR source but target codec is H.264 (no 10-bit), so treat as banding-prone.
-        #   - hdr_8bit_source: source is HDR but only 8-bit; also banding-prone.
-        hdr_output_limited = source_stats.is_hdr and target_codec == "h264"
-        hdr_8bit_source = source_stats.is_hdr and source_stats.bit_depth and source_stats.bit_depth <= 8
+        #   Flag HDR outputs that are likely to band.
+        #   That happens when there is no HDR10 path or when the HDR source is only 8-bit.
+        hdr_output_limited = False
+        hdr_output_limited_reason = None
+        if source_stats.is_hdr:
+            if target_supports_hdr10 is False:
+                hdr_output_limited = True
+                hdr_output_limited_reason = "hdr_output_not_supported"
+            elif source_stats.bit_depth and source_stats.bit_depth <= 8:
+                hdr_output_limited = True
+                hdr_output_limited_reason = "hdr_8bit_source"
 
         # Base params per goal:
-        #   Prefer Quality uses constqp/QP for maximum preservation.
-        #   Balanced/Prefer Compression use CQ-VBR with codec-specific CQ ladders.
-        #   Keep this split so quality-first avoids VBR variability while compression goals can lean on maxrate/bufsize guardrails.
+        #   Prefer Quality uses fixed CQ/QP values.
+        #   The other goals pull from codec/goal/resolution ladders and fall back to safe defaults when needed.
         if goal == self.GOAL_PREFER_QUALITY:
-            qp = 19 if not source_stats.is_hdr else 17
-            cq = None
-            lookahead = 20
+            quality_index = 17 if source_stats.is_hdr else 19
         else:
-            qp = None
-            cq = self._base_cq_for_codec(target_codec, goal, source_stats.is_hdr, resolution_bucket)
-            if not cq:
-                cq = 24 if not source_stats.is_hdr else 22
+            quality_index = self._base_quality_index(target_codec, goal, source_stats.is_hdr, target_bucket)
+            if quality_index is None:
+                quality_index = 24 if not source_stats.is_hdr else 22
                 if goal == self.GOAL_PREFER_COMPRESSION:
-                    cq = 30 if not source_stats.is_hdr else 28
-            lookahead = 12
+                    quality_index = 30 if not source_stats.is_hdr else 28
 
-        # AQ defaults:
-        #   Leave spatial AQ on for all goals.
-        #   Use temporal AQ only when running VBR (constqp disables it).
-        enable_aq = True
-        aq_strength = 8
-        temporal_aq = rc_mode == "vbr"
-
-        # HDR 8-bit handling (CQ/QP side):
-        #   Be conservative and lower CQ/QP slightly.
-        #   HDR in 8-bit is much more prone to banding.
-        #   When you push compression harder, the first “bad-looking” failure
-        #   mode is often banding rather than blockiness.
-        hdr_banding_sensitive = source_stats.is_hdr and (hdr_output_limited or hdr_8bit_source)
-        if hdr_banding_sensitive:
-            if cq is not None:
-                cq = max(0, cq - 2)
-            if rc_mode == "constqp" and qp is not None:
-                qp = max(0, qp - 1)
-
-        # Build bitrate params for VBR modes:
-        #   Cap maxrate/bufsize using derived guardrails.
-        maxrate = None
-        bufsize = None
-        if rc_mode == "vbr" and target_cap:
-            maxrate = int(target_cap)
-            bufsize_factor = 2.0
-            bufsize = int(target_cap * bufsize_factor)
-            # Derive cq if we downgraded from constqp
-            if downgraded_to_vbr and not cq:
-                cq = 22 if not source_stats.is_hdr else 20
-            elif not cq:
-                cq = 26 if goal == self.GOAL_PREFER_COMPRESSION else 23
-        elif rc_mode == "vbr" and not cq:
-            cq = 26 if goal == self.GOAL_PREFER_COMPRESSION else 23
-
-        # HDR 8-bit handling (bitrate rails):
-        #   Nudge caps upward slightly to soften banding risk on sensitive HDR outputs.
-        if hdr_banding_sensitive:
-            if maxrate:
-                maxrate = int(maxrate * 1.05)
-            if bufsize:
-                bufsize = int(bufsize * 1.05)
-
-        # Re-encode penalty/bonus per codec direction:
-        #   Aggressive CQ on already-efficient sources (HEVC/AV1) compounds artifacts, so bias toward lower CQ.
-        #   Conversely, H.264 -> HEVC can tolerate a slightly higher CQ for similar perceptual results.
+        # Apply re-encode bias and HDR banding sensitivity adjustments.
         cq_offset = self._reencode_cq_offset(source_stats.codec_name, target_codec)
-        if cq is not None:
-            cq = max(0, cq + cq_offset)
-        if rc_mode == "constqp" and qp is not None and cq_offset:
-            qp = max(0, qp - cq_offset)  # lower qp for negative offsets = higher quality
+        if quality_index is not None and quality_mode != self.QUALITY_CONST:
+            quality_index = max(0, quality_index + cq_offset)
+
+        # HDR-limited output (no HDR10 path or 8-bit HDR):
+        #   Lower CQ/QP a bit to reduce the chance of banding.
+        if hdr_output_limited and quality_index is not None:
+            quality_index = max(0, quality_index - 2)
+
+        # Build bitrate rails (maxrate/bufsize) only when caps make sense for the chosen mode/scale.
+        wants_cap = bool(target_cap) and quality_mode in (self.QUALITY_CAPPED, self.QUALITY_TARGET)
+        if downgraded_reason and target_cap:
+            wants_cap = True
+
+        # Build bitrate params for VBR modes using the derived guardrail cap.
+        maxrate = int(target_cap) if target_cap and wants_cap else None
+        bufsize = int(target_cap * 2.0) if target_cap and wants_cap else None
 
         # Confidence tracking and adjustments:
-        #   When key probe stats are missing, ease quantizers and drop temporal AQ.
+        #   Mark low confidence when HDR output is limited or probe stats are weak.
+        #   Ease CQ when confidence is low.
         confidence_level = source_stats.confidence_level
         confidence = confidence_level != "low"
         confidence_notes = list(source_stats.confidence_notes)
         if hdr_output_limited:
             confidence = False
             confidence_level = "low"
-            confidence_notes.append("hdr_forced_8bit_output")
-            logger.info("HDR source detected but target codec lacks 10-bit; applying conservative settings.")
-        elif hdr_8bit_source:
-            confidence = False
-            confidence_level = "low"
-            confidence_notes.append("hdr_8bit_source")
+            if hdr_output_limited_reason:
+                confidence_notes.append(hdr_output_limited_reason)
+            if hdr_output_limited_reason == "hdr_output_not_supported":
+                logger.info("HDR source detected but target encoder lacks HDR10 output; applying conservative settings.")
+        if not confidence:
+            if quality_index is not None:
+                quality_index = max(0, quality_index - 2)
         if confidence_level != "high":
             logger.info("Smart output target low confidence: level=%s reasons=%s", confidence_level, confidence_notes)
-        if not confidence:
-            if cq is not None:
-                cq = max(16, cq - 2)
-            if qp is not None:
-                qp = max(14, qp - 2)
-            temporal_aq = False
+
+        master_display = None
+        max_cll = None
+        try:
+            hdr_md = self.probe.get_hdr_static_metadata()
+            master_display = hdr_md.get("master_display")
+            max_cll = hdr_md.get("max_cll")
+        except Exception:
+            master_display = None
+            max_cll = None
 
         recommendation = {
             "goal": goal,
-            "rc_mode": rc_mode,
-            "qp": qp,
-            "cq": cq,
-            "lookahead": lookahead,
-            "enable_aq": enable_aq,
-            "aq_strength": aq_strength,
-            "temporal_aq": temporal_aq,
+            "quality_mode": quality_mode,
+            "quality_index": quality_index,
+            "wants_cap": wants_cap,
             "maxrate": maxrate,
             "bufsize": bufsize,
             "target_cap": target_cap,
             "pixel_ratio": pixel_ratio,
-            "downgraded_to_vbr": downgraded_to_vbr,
+            "downgraded_reason": downgraded_reason,
             "confidence": confidence,
             "confidence_level": confidence_level,
             "confidence_notes": confidence_notes,
             "target_resolution": {"width": target_width, "height": target_height},
             "source_resolution": {"width": source_stats.width, "height": source_stats.height},
+            "hdr": {
+                "is_hdr": source_stats.is_hdr,
+                "bit_depth": source_stats.bit_depth,
+                "output_supported": not hdr_output_limited,
+                "master_display": master_display,
+                "max_cll": max_cll,
+            },
+            "target_supports_hdr10": target_supports_hdr10,
+            "source_bucket": source_bucket,
+            "target_bucket": target_bucket,
         }
         logger.info(
-            "Smart output target recommendation: goal=%s rc=%s qp=%s cq=%s preset_lookahead=%s aq=%s temporal_aq=%s maxrate=%s bufsize=%s confidence=%s confidence_notes=%s",
+            "Smart output target recommendation: goal=%s quality_mode=%s quality_index=%s cap=%s maxrate=%s bufsize=%s confidence=%s notes=%s",
             recommendation.get("goal"),
-            recommendation.get("rc_mode"),
-            recommendation.get("qp"),
-            recommendation.get("cq"),
-            recommendation.get("lookahead"),
-            recommendation.get("enable_aq"),
-            recommendation.get("temporal_aq"),
+            recommendation.get("quality_mode"),
+            recommendation.get("quality_index"),
+            recommendation.get("target_cap"),
             recommendation.get("maxrate"),
             recommendation.get("bufsize"),
             recommendation.get("confidence"),
