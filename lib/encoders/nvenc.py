@@ -204,7 +204,7 @@ def get_configured_device_info(settings):
     if settings.get_setting('nvenc_device') not in ['none']:
         # Attempt to match to that configured hardware device
         for hw_device in hardware_devices:
-            if settings.get_setting('nvenc_device') == hw_device.get('hwaccel_device'):
+            if str(settings.get_setting('nvenc_device')) == str(hw_device.get('hwaccel_device')):
                 hardware_device = hw_device
                 break
     # If no matching hardware device is set, then select the first one
@@ -533,7 +533,8 @@ class NvencEncoder(Encoder):
         if self.settings.get_setting('nvenc_enable_temporal_aq'):
             temporal_aq_supported = _supports_temporal_aq(encoder_name, hardware_device.get('hwaccel_device', 0))
             if not temporal_aq_supported:
-                logger.info("NVENC temporal AQ is configured, but this GPU does not appear to support it. This will likely fail.")
+                logger.warning(
+                    "NVENC temporal AQ is configured, but this GPU does not appear to support it. This will likely fail.")
             stream_args += [f'-temporal-aq:v:{stream_id}', '1']
 
         # If CUVID is enabled, return generic_kwargs
