@@ -30,6 +30,7 @@ from video_transcoder.lib.encoders.vaapi import VaapiEncoder
 from video_transcoder.lib.encoders.nvenc import NvencEncoder
 from video_transcoder.lib.encoders.libsvtav1 import LibsvtAv1Encoder
 from video_transcoder.lib.ffmpeg import Probe, StreamMapper
+from video_transcoder.lib.smart_black_bar_detect import SmartBlackBarDetect
 
 # Configure plugin logger
 logger = logging.getLogger("Unmanic.Plugin.video_transcoder")
@@ -100,7 +101,8 @@ class PluginStreamMapper(StreamMapper):
         if self.settings.get_setting('mode') in ['basic', 'standard']:
             if self.settings.get_setting('apply_smart_filters') and self.settings.get_setting('autocrop_black_bars'):
                 # Test if the file has black bars
-                self.crop_value = tools.detect_black_bars(abspath, probe.get_probe(), self.settings)
+                detector = SmartBlackBarDetect(self.worker_log)
+                self.crop_value = detector.detect_black_bars(abspath, probe.get_probe(), self.settings)
                 if self.crop_value:
                     tools.append_worker_log(self.worker_log, "Stream mapper detected black bars - crop='{}'".format(self.crop_value))
 
