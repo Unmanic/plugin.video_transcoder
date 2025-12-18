@@ -36,8 +36,9 @@ logger = logging.getLogger("Unmanic.Plugin.video_transcoder")
 
 
 class PluginStreamMapper(StreamMapper):
-    def __init__(self):
+    def __init__(self, worker_log=None):
         super(PluginStreamMapper, self).__init__(logger, ['video', 'data', 'attachment'])
+        self.worker_log = worker_log if isinstance(worker_log, list) else None
         self.abspath = None
         self.settings = None
         self.complex_video_filters = {}
@@ -63,6 +64,13 @@ class PluginStreamMapper(StreamMapper):
         self.set_input_file(abspath)
         # Configure settings
         self.settings = settings
+        tools.append_worker_log(
+            self.worker_log,
+            "Stream mapper configured (mode='{}', encoder='{}')".format(
+                self.settings.get_setting('mode'),
+                self.settings.get_setting('video_encoder'),
+            )
+        )
 
         # Build default options of advanced mode
         if self.settings.get_setting('mode') == 'advanced':
@@ -93,6 +101,8 @@ class PluginStreamMapper(StreamMapper):
             if self.settings.get_setting('apply_smart_filters') and self.settings.get_setting('autocrop_black_bars'):
                 # Test if the file has black bars
                 self.crop_value = tools.detect_black_bars(abspath, probe.get_probe(), self.settings)
+                if self.crop_value:
+                    tools.append_worker_log(self.worker_log, "Stream mapper detected black bars - crop='{}'".format(self.crop_value))
 
         # Build hardware acceleration args based on encoder
         # Note: these are not applied to advanced mode - advanced mode was returned above
@@ -108,10 +118,31 @@ class PluginStreamMapper(StreamMapper):
         Mark mapper to rebuild stream args for execution (not lightweight checks).
         """
         self.execution_stage = True
+        tools.append_worker_log(self.worker_log, "Stream mapper entering execution stage")
         # Reset cached mappings to rebuild with execution-stage logic
         self.stream_mapping = []
         self.stream_encoding = []
         self.complex_video_filters = {}
+
+    def streams_need_processing(self):
+        tools.append_worker_log(
+            self.worker_log,
+            "Stream mapper building stream mapping (stage='{}')".format(
+                "execution" if self.execution_stage else "analysis"
+            )
+        )
+        needs_processing = super(PluginStreamMapper, self).streams_need_processing()
+        tools.append_worker_log(
+            self.worker_log,
+            "Stream mapper stream summary (video={}, audio={}, subtitle={}, data={}, attachment={})".format(
+                self.video_stream_count,
+                self.audio_stream_count,
+                self.subtitle_stream_count,
+                self.data_stream_count,
+                self.attachment_stream_count,
+            )
+        )
+        return needs_processing
 
     def scale_resolution(self, stream_info: dict):
         def get_test_resolution(settings):
@@ -155,6 +186,7 @@ class PluginStreamMapper(StreamMapper):
         :param stream_id:
         :return:
         """
+        tools.append_worker_log(self.worker_log, "Stream mapper building filter chain for video stream {}".format(stream_id))
         software_filters = []
         hardware_filters = []
         filter_args = []
@@ -337,6 +369,10 @@ class PluginStreamMapper(StreamMapper):
         encoder_name = self.settings.get_setting('video_encoder')
 
         if codec_type in ['video']:
+            tools.append_worker_log(
+                self.worker_log,
+                "Stream mapper mapping video stream {} for encoding (encoder='{}')".format(stream_id, encoder_name)
+            )
             if self.settings.get_setting('mode') == 'advanced':
                 stream_encoding = ['-c:{}'.format(stream_specifier)]
                 stream_encoding += self.settings.get_setting('custom_options').split()
@@ -398,6 +434,7 @@ class PluginStreamMapper(StreamMapper):
                 return False
             # Remove if settings configured to do so, strip the data stream
             if self.settings.get_setting('strip_data_streams'):
+                tools.append_worker_log(self.worker_log, "Stream mapper stripping data stream {}".format(stream_id))
                 return {
                     'stream_mapping':  [],
                     'stream_encoding': [],
@@ -411,6 +448,7 @@ class PluginStreamMapper(StreamMapper):
                 return False
             # Remove if settings configured to do so, strip the attachment stream
             if self.settings.get_setting('strip_attachment_streams'):
+                tools.append_worker_log(self.worker_log, "Stream mapper stripping attachment stream {}".format(stream_id))
                 return {
                     'stream_mapping':  [],
                     'stream_encoding': [],

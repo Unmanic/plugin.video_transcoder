@@ -119,6 +119,19 @@ resolution_map = {
 }
 
 
+def append_worker_log(worker_log, line: str):
+    """
+    Append a log line to Unmanic's `worker_log` list (if provided).
+    """
+    if worker_log is None or not isinstance(worker_log, list):
+        return
+    try:
+        worker_log.append(str(line))
+    except Exception:
+        # Never break processing due to logging issues
+        return
+
+
 def available_encoders(settings=None, probe=None):
     return_encoders = {}
     encoder_libs = [
@@ -273,8 +286,8 @@ def detect_black_bars(abspath, probe_data, settings):
                 parts = ts.split(":")
                 if len(parts) >= 3:
                     try:
-                        h = float(parts[0]);
-                        m = float(parts[1]);
+                        h = float(parts[0])
+                        m = float(parts[1])
                         s = float(parts[2])
                         return h * 3600 + m * 60 + s
                     except (TypeError, ValueError):
@@ -340,8 +353,10 @@ def detect_black_bars(abspath, probe_data, settings):
         def too_small(v: int, thr: int) -> bool:
             return 0 < v < thr
 
-        if too_small(left, min_bar_lr):  left = 0
-        if too_small(right, min_bar_lr):  right = 0
+        if too_small(left, min_bar_lr):
+            left = 0
+        if too_small(right, min_bar_lr):
+            right = 0
 
         # If nothing remains to trim, skip
         if top == 0 and bottom == 0 and left == 0 and right == 0:

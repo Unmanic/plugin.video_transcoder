@@ -236,6 +236,8 @@ def on_worker_process(data):
     data['exec_command'] = []
     data['repeat'] = False
 
+    worker_log = data.get('worker_log')
+
     # Get settings (do not persist defaults during worker execution)
     settings = Settings(library_id=data.get('library_id'), apply_default_fallbacks=False)
 
@@ -243,25 +245,31 @@ def on_worker_process(data):
     abspath = data.get('file_in')
 
     # Get file probe
+    tools.append_worker_log(worker_log, "Probing file: {}".format(abspath))
     probe = Probe(logger, allowed_mimetypes=['video'])
     if not probe.file(abspath):
         # File probe failed, skip the rest of this test
+        tools.append_worker_log(worker_log, "Probe failed - skipping file")
         return
 
     # Get stream mapper
-    mapper = plugin_stream_mapper.PluginStreamMapper()
+    mapper = plugin_stream_mapper.PluginStreamMapper(worker_log=worker_log)
     mapper.set_default_values(settings, abspath, probe)
 
     # Check if this file needs to be processed
-    if mapper.streams_need_processing():
+    tools.append_worker_log(worker_log, "Checking what streams need processing...")
+    needs_processing = mapper.streams_need_processing()
+    if needs_processing:
         if file_marked_as_force_transcoded(abspath) and mapper.forced_encode:
             # Do not process this file, it has been force transcoded once before
+            tools.append_worker_log(worker_log, "File previously force transcoded - skipping")
             return
 
         # Set the output file
         if settings.get_setting('keep_container'):
             # Do not remux the file. Keep the file out in the same container
             mapper.set_output_file(data.get('file_out'))
+            tools.append_worker_log(worker_log, "Output container kept - writing to: {}".format(data.get('file_out')))
         else:
             # Force the remux to the configured container
             container_extension = settings.get_setting('dest_container')
@@ -269,12 +277,14 @@ def on_worker_process(data):
             new_file_out = "{}.{}".format(split_file_out[0], container_extension.lstrip('.'))
             mapper.set_output_file(new_file_out)
             data['file_out'] = new_file_out
+            tools.append_worker_log(worker_log, "Output container set to '{}' - writing to: {}".format(container_extension, new_file_out))
 
         # # Pretty, wrapped printing of the command to null for debugging. Should always be commented out.
         # mapper.set_output_null()
         # print(tools.format_command_multiline(mapper, max_width=120))
 
         # Get generated ffmpeg args
+        tools.append_worker_log(worker_log, "Generating FFmpeg command...")
         mapper.enable_execution_stage()
         mapper.streams_need_processing()
         ffmpeg_args = mapper.get_ffmpeg_args()
@@ -294,6 +304,8 @@ def on_worker_process(data):
                 os.makedirs(cache_directory)
             with open(os.path.join(cache_directory, '.force_transcode'), 'w') as f:
                 f.write('')
+    else:
+        tools.append_worker_log(worker_log, "No streams require processing - no FFmpeg command generated")
 
     return
 
