@@ -581,8 +581,8 @@ def detect_black_bars(abspath, probe_data, settings):
                      start_step)
 
     elif total_duration <= 10 * 60:
-        # 5–10min → 20s windows, ~30s gap, start at 90s (hopefully skip any intros)
-        sample_len = 20
+        # 5–10min → 10s windows, ~30s gap, start at 90s (hopefully skip any intros)
+        sample_len = 10
         long_gap = 30
         first_start = 90
         start_step = sample_len + long_gap  # 20 + 30 = 50s between starts
@@ -592,8 +592,8 @@ def detect_black_bars(abspath, probe_data, settings):
                      long_gap, start_step, first_start)
 
     else:
-        # >10min → 20s windows, ~30s gap, start at 5:00 (should skip any intros)
-        sample_len = 20
+        # >10min → 10s windows, ~30s gap, start at 5:00 (should skip any intros)
+        sample_len = 10
         long_gap = 90
         first_start = 300
         start_step = sample_len + long_gap  # 20 + 90 = 1:50s between starts

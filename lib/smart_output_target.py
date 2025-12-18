@@ -56,6 +56,8 @@ class SourceStats:
 class SmartOutputTargetHelper:
     """Human-readable helper for selecting sane encoder params in Basic mode."""
 
+    _LOG_PREFIX = "[SmartOutputTargetHelper]"
+
     GOAL_PREFER_QUALITY = "prefer_quality"
     GOAL_BALANCED = "balanced"
     GOAL_PREFER_COMPRESSION = "prefer_compression"
@@ -84,14 +86,6 @@ class SmartOutputTargetHelper:
         "uhd": 6_000_000,
     }
 
-    # This table provides lower bounds for bitrate caps by goal and resolution bucket when deriving rails.
-    # Goal shifts how low we allow the cap to drop, while sd/hd/uhd buckets scale minimum expectations.
-    _FLOOR_BITRATES = {
-        GOAL_PREFER_QUALITY:     {"sd": 1_100_000, "hd": 3_000_000, "uhd": 7_000_000},
-        GOAL_BALANCED:           {"sd": 900_000, "hd": 2_400_000, "uhd": 6_000_000},
-        GOAL_PREFER_COMPRESSION: {"sd": 750_000, "hd": 2_000_000, "uhd": 5_000_000},
-    }
-
     # This table provides CQ ladders keyed by codec -> goal -> dynamic range -> resolution bucket.
     # Codec nudges the ladder based on encoder behaviour (hevc/h264/av1); goal balances size vs fidelity;
     # HDR entries lower CQ to reduce banding risk; sd/hd/uhd buckets scale quantisers with detail expectations.
@@ -102,18 +96,26 @@ class SmartOutputTargetHelper:
                 "hdr": {"sd": 26, "hd": 27, "uhd": 28},
             },
             GOAL_BALANCED: {
-                "sdr": {"sd": 24, "hd": 25, "uhd": 26},
-                "hdr": {"sd": 23, "hd": 24, "uhd": 25},
+                "sdr": {"sd": 25, "hd": 26, "uhd": 27},
+                "hdr": {"sd": 24, "hd": 25, "uhd": 26},
+            },
+            GOAL_PREFER_QUALITY: {
+                "sdr": {"sd": 23, "hd": 24, "uhd": 25},
+                "hdr": {"sd": 22, "hd": 23, "uhd": 24},
             },
         },
         "h264": {
             GOAL_PREFER_COMPRESSION: {
-                "sdr": {"sd": 25, "hd": 26, "uhd": 27},
-                "hdr": {"sd": 24, "hd": 25, "uhd": 26},
+                "sdr": {"sd": 24, "hd": 25, "uhd": 26},
+                "hdr": {"sd": 23, "hd": 24, "uhd": 25},
             },
             GOAL_BALANCED: {
                 "sdr": {"sd": 22, "hd": 23, "uhd": 24},
                 "hdr": {"sd": 21, "hd": 22, "uhd": 23},
+            },
+            GOAL_PREFER_QUALITY: {
+                "sdr": {"sd": 20, "hd": 21, "uhd": 22},
+                "hdr": {"sd": 19, "hd": 20, "uhd": 21},
             },
         },
         "av1": {
@@ -124,6 +126,10 @@ class SmartOutputTargetHelper:
             GOAL_BALANCED: {
                 "sdr": {"sd": 24, "hd": 25, "uhd": 26},
                 "hdr": {"sd": 23, "hd": 24, "uhd": 25},
+            },
+            GOAL_PREFER_QUALITY: {
+                "sdr": {"sd": 22, "hd": 23, "uhd": 24},
+                "hdr": {"sd": 21, "hd": 22, "uhd": 23},
             },
         },
     }
@@ -146,6 +152,42 @@ class SmartOutputTargetHelper:
         ("vp9", "vp9"): -1,
     }
 
+    # Minimum bits-per-pixel-per-frame guardrails, scaled by goal, HDR, and FPS bucket.
+    # Higher FPS buckets demand more minimum bitrate; HDR entries give a small bump to reduce banding risk.
+    _MIN_BPPPF = {
+        GOAL_PREFER_QUALITY: {
+            "sdr": {"low_motion": 0.050, "medium_motion": 0.060, "high_motion": 0.070},
+            "hdr": {"low_motion": 0.055, "medium_motion": 0.065, "high_motion": 0.075},
+        },
+        GOAL_BALANCED: {
+            "sdr": {"low_motion": 0.040, "medium_motion": 0.050, "high_motion": 0.060},
+            "hdr": {"low_motion": 0.045, "medium_motion": 0.055, "high_motion": 0.065},
+        },
+        GOAL_PREFER_COMPRESSION: {
+            "sdr": {"low_motion": 0.033, "medium_motion": 0.040, "high_motion": 0.048},
+            "hdr": {"low_motion": 0.038, "medium_motion": 0.045, "high_motion": 0.053},
+        },
+    }
+
+    # Codec/encoder efficiency scalers for bitrate floors (lower means more efficient output).
+    _CODEC_EFFICIENCY = {
+        ("libx265", "hevc"): 0.75,
+        ("hevc_nvenc", "hevc"): 0.85,
+        ("hevc_qsv", "hevc"): 0.82,
+        ("libx264", "h264"): 1.0,
+        ("h264_nvenc", "h264"): 1.05,
+        ("h264_qsv", "h264"): 1.02,
+        ("libsvtav1", "av1"): 0.65,
+        ("av1_nvenc", "av1"): 0.70,
+        ("av1_qsv", "av1"): 0.70,
+        ("vp9_vaapi", "vp9"): 0.90,
+        # Codec-only fallbacks
+        "h264": 1.0,
+        "hevc": 0.80,
+        "av1": 0.65,
+        "vp9": 0.85,
+    }
+
     def __init__(self, probe, max_probe_seconds: float = 2.0):
         self.probe = probe
         self.max_probe_seconds = max_probe_seconds
@@ -165,6 +207,86 @@ class SmartOutputTargetHelper:
         except (TypeError, ValueError):
             return None
 
+    def _parse_duration_hhmmss(self, duration_tag: Optional[str]) -> Optional[float]:
+        """
+        Parse common duration formats found in Matroska statistics tags.
+
+        Examples:
+            "00:10:34.534000000" -> 634.534
+            "0:10:34.534" -> 634.534
+        """
+        if not duration_tag or not isinstance(duration_tag, str) or ":" not in duration_tag:
+            return None
+        try:
+            h, m, s = duration_tag.split(":")
+            return float(h) * 3600 + float(m) * 60 + float(s)
+        except (ValueError, TypeError):
+            return None
+
+    def _get_tag_value(self, tags: Optional[Dict], key: str) -> Optional[str]:
+        """
+        Fetch a tag value from an ffprobe `tags` dict, supporting common variants like `-eng`
+        and case differences across containers and muxers.
+        """
+        if not isinstance(tags, dict) or not key:
+            return None
+
+        candidates = (
+            key,
+            key.upper(),
+            key.lower(),
+            f"{key}-eng",
+            f"{key.upper()}-eng",
+            f"{key.lower()}-eng",
+        )
+        for candidate in candidates:
+            if candidate in tags:
+                return tags.get(candidate)
+
+        key_lower = key.lower()
+        for tag_key, tag_value in tags.items():
+            if str(tag_key).lower() in (key_lower, f"{key_lower}-eng"):
+                return tag_value
+        return None
+
+    def _video_stream_from_probe(self, probe_dict: Dict) -> Optional[Dict]:
+        """
+        Return the primary video stream, skipping attached pictures when possible.
+        """
+        streams = probe_dict.get("streams") or []
+        for st in streams:
+            if st.get("codec_type") != "video":
+                continue
+            disposition = st.get("disposition") or {}
+            if disposition.get("attached_pic"):
+                continue
+            return st
+        return next((st for st in streams if st.get("codec_type") == "video"), None)
+
+    def _derive_video_bitrate_from_stream_tags(self, video_stream: Dict) -> Optional[int]:
+        """
+        Estimate a video-only bitrate from stream tags when `bit_rate` is missing.
+
+        Matroska files muxed with mkvmerge often include per-stream statistics tags:
+            - BPS (bits per second)
+            - NUMBER_OF_BYTES + DURATION
+        """
+        if not isinstance(video_stream, dict):
+            return None
+        tags = video_stream.get("tags") or {}
+
+        bps = self._safe_int(self._get_tag_value(tags, "BPS"))
+        if bps and bps > 0:
+            return bps
+
+        number_of_bytes = self._safe_int(self._get_tag_value(tags, "NUMBER_OF_BYTES"))
+        duration_tag = self._get_tag_value(tags, "DURATION")
+        duration_seconds = self._parse_duration_hhmmss(duration_tag)
+        if number_of_bytes and number_of_bytes > 0 and duration_seconds and duration_seconds > 0:
+            return int((number_of_bytes * 8) / duration_seconds)
+
+        return None
+
     def _duration_seconds(self, probe_dict: Dict) -> Optional[float]:
         fmt = probe_dict.get("format") or {}
         dur = self._safe_float(fmt.get("duration"))
@@ -179,12 +301,9 @@ class SmartOutputTargetHelper:
 
         tags = fmt.get("tags") or {}
         tag_dur = tags.get("DURATION")
-        if isinstance(tag_dur, str) and ":" in tag_dur:
-            try:
-                h, m, s = tag_dur.split(":")
-                return float(h) * 3600 + float(m) * 60 + float(s)
-            except (ValueError, TypeError):
-                return None
+        duration = self._parse_duration_hhmmss(tag_dur)
+        if duration:
+            return duration
         return None
 
     def _bit_depth_from_pix_fmt(self, pix_fmt: Optional[str], default: Optional[int] = None) -> Optional[int]:
@@ -202,8 +321,9 @@ class SmartOutputTargetHelper:
 
     def _derive_bitrate(self, probe_dict: Dict, file_path: Optional[str], duration: Optional[float]):
         """Pull bitrates from stream/container; fall back to size/duration."""
-        video_stream = next((st for st in probe_dict.get("streams", []) if st.get("codec_type") == "video"), None)
+        video_stream = self._video_stream_from_probe(probe_dict)
         stream_bitrate = self._safe_int(video_stream.get("bit_rate")) if video_stream else None
+        tag_bitrate = self._derive_video_bitrate_from_stream_tags(video_stream) if not stream_bitrate else None
         container_bitrate = self._safe_int((probe_dict.get("format") or {}).get("bit_rate"))
 
         filesize_bits = None
@@ -216,6 +336,8 @@ class SmartOutputTargetHelper:
         derived = None
         if stream_bitrate:
             derived = stream_bitrate
+        elif tag_bitrate:
+            derived = tag_bitrate
         elif container_bitrate:
             derived = container_bitrate
         elif filesize_bits and duration and duration > 0:
@@ -339,9 +461,10 @@ class SmartOutputTargetHelper:
         )
 
         logger.info(
-            "Smart output target source stats: res=%sx%s codec=%s hdr=%s bit_depth=%s "
+            "%s Smart output target source stats: res=%sx%s codec=%s hdr=%s bit_depth=%s "
             "bitrate_derived=%s stream_bitrate=%s container_bitrate=%s "
             "confidence=%s level=%s reasons=%s",
+            self._LOG_PREFIX,
             stats.width,
             stats.height,
             stats.codec_name,
@@ -368,36 +491,88 @@ class SmartOutputTargetHelper:
             return "hd"
         return "sd"
 
-    def _floor_bitrate(self, goal: str, resolution_bucket: str) -> int:
-        return self._FLOOR_BITRATES.get(goal, {}).get(resolution_bucket, 0)
-
     def _clamp(self, value: float, min_value: float, max_value: float) -> float:
         return max(min_value, min(value, max_value))
+
+    def _fps_bucket_and_offset(self, fps: float):
+        """
+        Bucket FPS into speed classes and return the quality ladder offset for that class.
+        """
+        bucket = "low_motion"
+        offset = 0
+        if 30 <= fps < 45:
+            bucket = "medium_motion"
+            offset = -1
+        elif fps >= 45:
+            bucket = "high_motion"
+            offset = -2
+        return bucket, offset
+
+    def _min_bpppf_value(self, goal: str, is_hdr: bool, fps_bucket: str) -> Optional[float]:
+        """
+        Look up the minimum bits-per-pixel-per-frame value for the given goal/HDR/FPS bucket.
+        """
+        goal_table = self._MIN_BPPPF.get(goal) or self._MIN_BPPPF.get(self.GOAL_BALANCED, {})
+        range_table = goal_table.get("hdr" if is_hdr else "sdr", {})
+        return range_table.get(fps_bucket) or range_table.get("medium_motion") or next(
+            iter(range_table.values()), None
+        )
+
+    def _codec_efficiency_factor(self, target_codec: str, target_encoder: str) -> float:
+        """
+        Scale bitrate floors by the relative efficiency of the target codec.
+        """
+        codec = (target_codec or "").lower()
+        encoder = (target_encoder or "").lower()
+        return self._CODEC_EFFICIENCY.get((encoder, codec), self._CODEC_EFFICIENCY.get(codec, 1.0))
+
+    def _min_target_bitrate(
+        self,
+        goal: str,
+        target_codec: str,
+        target_encoder: str,
+        is_hdr: bool,
+        fps_bucket: str,
+        target_width: int,
+        target_height: int,
+        target_fps: float,
+        min_bpppf: Optional[float] = None,
+    ) -> Optional[int]:
+        """
+        Compute a normalized bitrate floor using bits-per-pixel-per-frame, scaled by resolution, FPS, and codec.
+        """
+        area = max(target_width, 0) * max(target_height, 0)
+        if area <= 0 or not target_fps or target_fps <= 0:
+            return None
+        min_bpppf = min_bpppf if min_bpppf is not None else self._min_bpppf_value(goal, is_hdr, fps_bucket)
+        if not min_bpppf:
+            return None
+        codec_factor = self._codec_efficiency_factor(target_codec, target_encoder)
+        return int(min_bpppf * area * target_fps * codec_factor)
 
     def _target_cap(
         self,
         goal: str,
         source_bitrate: Optional[int],
-        pixel_ratio: float,
+        rate_ratio: float,
         is_hdr: bool,
-        apply_floor: bool,
-        floor_br: int,
+        min_target_bitrate: Optional[int],
     ):
         """
-        Guardrail: cap bitrate relative to source, scaled by pixel ratio.
+        Guardrail: cap bitrate relative to source, scaled by rate ratio (pixels * fps).
         """
         if not source_bitrate:
-            return int(floor_br) if apply_floor and floor_br else None
+            return int(min_target_bitrate) if min_target_bitrate else None
         cap_factor = self._CAP_FACTORS.get(goal, 1.1)
         if is_hdr and goal != self.GOAL_PREFER_QUALITY:
             cap_factor += 0.05
-        base_cap = source_bitrate * pixel_ratio
+        base_cap = source_bitrate * rate_ratio
         same_res_cap = source_bitrate * 1.05
-        upper_cap = source_bitrate if pixel_ratio < 1 else source_bitrate * 1.05
-        target_cap = (base_cap if pixel_ratio < 1 else same_res_cap) * cap_factor
+        upper_cap = source_bitrate if rate_ratio < 1 else source_bitrate * 1.05
+        target_cap = (base_cap if rate_ratio < 1 else same_res_cap) * cap_factor
         candidate = target_cap
-        if apply_floor and floor_br:
-            candidate = max(candidate, floor_br)
+        if min_target_bitrate:
+            candidate = max(candidate, min_target_bitrate)
         return int(self._clamp(candidate, 0, upper_cap))
 
     # --------------------------
@@ -439,8 +614,10 @@ class SmartOutputTargetHelper:
             - quality_index: abstract quantiser step (ladder entry)
             - wants_cap: desire to apply a bitrate rail
         """
-        goal = goal or self.GOAL_BALANCED
-        goal = goal if goal in self._GOALS else self.GOAL_BALANCED
+        requested_goal = goal or self.GOAL_BALANCED
+        goal = requested_goal if requested_goal in self._GOALS else self.GOAL_BALANCED
+        if requested_goal != goal:
+            logger.debug("%s Smart target goal normalized from '%s' to '%s'", self._LOG_PREFIX, requested_goal, goal)
 
         target_width = int(target_filters.get("target_width") or source_stats.width or 0)
         target_height = int(target_filters.get("target_height") or source_stats.height or 0)
@@ -454,8 +631,21 @@ class SmartOutputTargetHelper:
         target_codec = (target_codec or "").lower()
         target_encoder = (target_encoder or "").lower()
 
+        logger.debug(
+            "%s Smart target dimensions/buckets: target=%sx%s (%s) source=%sx%s (%s) pixel_ratio=%.3f",
+            self._LOG_PREFIX,
+            target_width,
+            target_height,
+            target_bucket,
+            source_width,
+            source_height,
+            source_bucket,
+            pixel_ratio,
+        )
+
         logger.info(
-            "Smart output target recommend_params input: goal=%s target_codec=%s target_encoder=%s target=%sx%s source_bitrate=%s pixel_ratio=%.3f",
+            "%s Smart output target recommend_params input: goal=%s target_codec=%s target_encoder=%s target=%sx%s source_bitrate=%s pixel_ratio=%.3f",
+            self._LOG_PREFIX,
             goal,
             target_codec,
             target_encoder,
@@ -465,18 +655,83 @@ class SmartOutputTargetHelper:
             pixel_ratio,
         )
 
+        # FPS + normalized complexity:
+        #   The cap/floor logic below needs an FPS value to behave sanely for high frame-rate sources.
+        #   When fps is not present in the probe, assume a typical film/TV cadence (24fps) rather than 0.
+        #   We treat "complexity" as (pixels * fps) instead of pixels-only so that 720p60 is not capped
+        #   as aggressively as 720p24. This aligns the ceiling behaviour (cap) with the floor behaviour
+        #   (minimum bpppf).
+        src_fps = source_stats.fps if source_stats.fps and source_stats.fps > 0 else 24.0
+        target_fps = src_fps
+        fps_bucket, fps_offset = self._fps_bucket_and_offset(src_fps)
+        min_bpppf = self._min_bpppf_value(goal, source_stats.is_hdr, fps_bucket)
+
+        # Encoder/codec efficiency adjustment:
+        #   The bpppf table yields a codec-agnostic minimum. Apply an efficiency multiplier based on the
+        #   chosen encoder+codec so that (for example) software x265 can hit similar perceptual quality at
+        #   lower bitrate than hardware NVENC for the same HEVC output.
+        codec_efficiency = self._codec_efficiency_factor(target_codec, target_encoder)
+
+        # Minimum target bitrate derived from bpppf:
+        #   Convert the normalized minimum bpppf into a bitrate floor for the *target* output:
+        #     min_rate = min_bpppf * target_area * target_fps * codec_efficiency
+        #   This floor scales naturally with resolution and FPS, and nudges based on output encoder/codec.
+        min_target_bitrate = self._min_target_bitrate(
+            goal,
+            target_codec,
+            target_encoder,
+            source_stats.is_hdr,
+            fps_bucket,
+            target_width,
+            target_height,
+            target_fps,
+            min_bpppf,
+        )
+
+        # Rate ratio (cap scaling input):
+        #   Derive a source→target scaling ratio using (area * fps). This replaces the legacy pixels-only
+        #   ratio so bitrate caps remain reasonable for high-FPS outputs.
+        #     rate_ratio = (target_area * target_fps) / (source_area * src_fps)
+        source_area = max(source_width * source_height, 1)
+        target_area = max(target_width * target_height, 1)
+        rate_ratio = (target_area * target_fps) / float(source_area * src_fps)
+        logger.debug(
+            "%s Rate ratio: src_area=%s src_fps=%.3f tgt_area=%s tgt_fps=%.3f -> rate_ratio=%.3f",
+            self._LOG_PREFIX,
+            source_area,
+            src_fps,
+            target_area,
+            target_fps,
+            rate_ratio,
+        )
+        logger.debug(
+            "%s Min bitrate floor: bpppf=%s codec_efficiency=%.3f target_fps=%.3f area=%s -> min_rate=%s",
+            self._LOG_PREFIX,
+            min_bpppf,
+            codec_efficiency,
+            target_fps,
+            target_width * target_height,
+            min_target_bitrate,
+        )
+
         # Bitrate cap guardrail:
-        #   Scale relative to the source and the pixel ratio.
-        #   This only applies a floor when bitrate is unknown or when we are not downscaling.
-        apply_floor = (source_bitrate is None) or pixel_ratio >= 1
-        floor_br = self._floor_bitrate(goal, target_bucket)
+        #   Scale relative to the source and the rate ratio (pixels * fps).
+        #   Anchor to a normalized bits-per-pixel-per-frame floor so high-FPS downscales are not over-clamped.
         target_cap = self._target_cap(
             goal,
             source_bitrate,
-            pixel_ratio,
+            rate_ratio,
             source_stats.is_hdr,
-            apply_floor,
-            floor_br,
+            min_target_bitrate,
+        )
+        logger.debug(
+            "%s Bitrate cap inputs: source_br=%s min_floor=%s rate_ratio=%.3f hdr=%s -> target_cap=%s",
+            self._LOG_PREFIX,
+            source_bitrate,
+            min_target_bitrate,
+            rate_ratio,
+            source_stats.is_hdr,
+            target_cap,
         )
 
         # Downscale guardrail for low-bitrate sources:
@@ -486,6 +741,15 @@ class SmartOutputTargetHelper:
         # Pick quality mode/index and record any downgrade reason.
         quality_mode = self.QUALITY_CONST if goal == self.GOAL_PREFER_QUALITY else self.QUALITY_CAPPED
         downgraded_reason = None
+        logger.debug(
+            "%s Initial quality mode=%s goal=%s source_bitrate=%s low_br_threshold=%s pixel_ratio=%.3f",
+            self._LOG_PREFIX,
+            quality_mode,
+            goal,
+            source_bitrate,
+            low_bitrate_threshold,
+            pixel_ratio,
+        )
         if (
             quality_mode == self.QUALITY_CONST
             and pixel_ratio < 1
@@ -494,6 +758,11 @@ class SmartOutputTargetHelper:
         ):
             quality_mode = self.QUALITY_CAPPED
             downgraded_reason = "low_bitrate_downscale"
+            logger.debug(
+                "%s Downgrading to capped quality due to low bitrate downscale (threshold=%s)",
+                self._LOG_PREFIX,
+                low_bitrate_threshold,
+            )
 
         # HDR handling guardrails:
         #   Flag HDR outputs that are likely to band.
@@ -507,37 +776,85 @@ class SmartOutputTargetHelper:
             elif source_stats.bit_depth and source_stats.bit_depth <= 8:
                 hdr_output_limited = True
                 hdr_output_limited_reason = "hdr_8bit_source"
+        if hdr_output_limited:
+            logger.debug(
+                "%s HDR output limited for encoder=%s reason=%s bit_depth=%s",
+                self._LOG_PREFIX,
+                target_encoder,
+                hdr_output_limited_reason,
+                source_stats.bit_depth,
+            )
 
         # Base params per goal:
-        #   Prefer Quality uses fixed CQ/QP values.
-        #   The other goals pull from codec/goal/resolution ladders and fall back to safe defaults when needed.
-        if goal == self.GOAL_PREFER_QUALITY:
-            quality_index = 17 if source_stats.is_hdr else 19
-        else:
-            quality_index = self._base_quality_index(target_codec, goal, source_stats.is_hdr, target_bucket)
-            if quality_index is None:
-                quality_index = 24 if not source_stats.is_hdr else 22
+        #   Pull from codec/goal/resolution ladders and fall back to safe defaults when needed.
+        quality_index = self._base_quality_index(target_codec, goal, source_stats.is_hdr, target_bucket)
+        ladder_pick = quality_index
+        if quality_index is None:
+            if goal == self.GOAL_PREFER_QUALITY:
+                quality_index = 22 if source_stats.is_hdr else 24
+            else:
+                quality_index = 24 if not source_stats.is_hdr else 26
                 if goal == self.GOAL_PREFER_COMPRESSION:
                     quality_index = 30 if not source_stats.is_hdr else 28
+        logger.debug(
+            "%s Quality index selection: ladder=%s fallback=%s goal=%s hdr=%s target_bucket=%s",
+            self._LOG_PREFIX,
+            ladder_pick,
+            quality_index,
+            goal,
+            source_stats.is_hdr,
+            target_bucket,
+        )
+
+        # FPS bucket adjustments:
+        #   Give higher frame rate sources a small quality boost.
+        if quality_index is not None and fps_offset:
+            quality_index = max(0, quality_index + fps_offset)
+        logger.debug(
+            "%s FPS adjustment: fps=%.3f bucket=%s offset=%s -> quality_index=%s",
+            self._LOG_PREFIX,
+            src_fps,
+            fps_bucket,
+            fps_offset,
+            quality_index,
+        )
 
         # Apply re-encode bias and HDR banding sensitivity adjustments.
         cq_offset = self._reencode_cq_offset(source_stats.codec_name, target_codec)
         if quality_index is not None and quality_mode != self.QUALITY_CONST:
             quality_index = max(0, quality_index + cq_offset)
+            logger.debug(
+                "%s Applied re-encode CQ offset: source_codec=%s target_codec=%s offset=%s -> quality_index=%s",
+                self._LOG_PREFIX,
+                source_stats.codec_name,
+                target_codec,
+                cq_offset,
+                quality_index,
+            )
 
         # HDR-limited output (no HDR10 path or 8-bit HDR):
         #   Lower CQ/QP a bit to reduce the chance of banding.
         if hdr_output_limited and quality_index is not None:
             quality_index = max(0, quality_index - 2)
+            logger.debug("%s HDR limited output; easing quality index to %s", self._LOG_PREFIX, quality_index)
 
         # Build bitrate rails (maxrate/bufsize) only when caps make sense for the chosen mode/scale.
         wants_cap = bool(target_cap) and quality_mode in (self.QUALITY_CAPPED, self.QUALITY_TARGET)
         if downgraded_reason and target_cap:
             wants_cap = True
+        logger.debug(
+            "%s Cap decision: target_cap=%s wants_cap=%s quality_mode=%s downgraded_reason=%s",
+            self._LOG_PREFIX,
+            target_cap,
+            wants_cap,
+            quality_mode,
+            downgraded_reason,
+        )
 
         # Build bitrate params for VBR modes using the derived guardrail cap.
         maxrate = int(target_cap) if target_cap and wants_cap else None
         bufsize = int(target_cap * 2.0) if target_cap and wants_cap else None
+        logger.debug("%s Cap rails: maxrate=%s bufsize=%s", self._LOG_PREFIX, maxrate, bufsize)
 
         # Confidence tracking and adjustments:
         #   Mark low confidence when HDR output is limited or probe stats are weak.
@@ -551,22 +868,32 @@ class SmartOutputTargetHelper:
             if hdr_output_limited_reason:
                 confidence_notes.append(hdr_output_limited_reason)
             if hdr_output_limited_reason == "hdr_output_not_supported":
-                logger.info("HDR source detected but target encoder lacks HDR10 output; applying conservative settings.")
+                logger.info(
+                    "%s HDR source detected but target encoder lacks HDR10 output; applying conservative settings.",
+                    self._LOG_PREFIX,
+                )
         if not confidence:
             if quality_index is not None:
                 quality_index = max(0, quality_index - 2)
+                logger.debug("%s Low confidence; easing quality index to %s", self._LOG_PREFIX, quality_index)
         if confidence_level != "high":
-            logger.info("Smart output target low confidence: level=%s reasons=%s", confidence_level, confidence_notes)
+            logger.info(
+                "%s Smart output target low confidence: level=%s reasons=%s",
+                self._LOG_PREFIX,
+                confidence_level,
+                confidence_notes,
+            )
 
         master_display = None
         max_cll = None
-        try:
-            hdr_md = self.probe.get_hdr_static_metadata()
-            master_display = hdr_md.get("master_display")
-            max_cll = hdr_md.get("max_cll")
-        except Exception:
-            master_display = None
-            max_cll = None
+        if source_stats.is_hdr:
+            try:
+                hdr_md = self.probe.get_hdr_static_metadata()
+                master_display = hdr_md.get("master_display")
+                max_cll = hdr_md.get("max_cll")
+            except Exception:
+                master_display = None
+                max_cll = None
 
         recommendation = {
             "goal": goal,
@@ -595,7 +922,8 @@ class SmartOutputTargetHelper:
             "target_bucket": target_bucket,
         }
         logger.info(
-            "Smart output target recommendation: goal=%s quality_mode=%s quality_index=%s cap=%s maxrate=%s bufsize=%s confidence=%s notes=%s",
+            "%s Smart output target recommendation: goal=%s quality_mode=%s quality_index=%s cap=%s maxrate=%s bufsize=%s confidence=%s notes=%s",
+            self._LOG_PREFIX,
             recommendation.get("goal"),
             recommendation.get("quality_mode"),
             recommendation.get("quality_index"),

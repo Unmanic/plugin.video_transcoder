@@ -391,9 +391,15 @@ class GlobalSettings:
         return values
 
     def get_smart_output_target_form_settings(self):
+        description = "Select the goal that best matches how you want Basic mode to balance quality and compression."
+        if self.settings.get_setting('apply_smart_filters') and \
+                self.settings.get_setting('target_resolution') not in ['source', None]:
+            description += (
+                "\n\nWarning: \"Prefer Quality\" is not recommended when scaling down the resolution of a video."
+            )
         values = {
             "label":          "Smart output target",
-            "description":    "Select the goal that best matches how you want Basic mode to balance quality and compression.",
+            "description":    description,
             "sub_setting":    True,
             "req_lev":        2,
             "input_type":     "select",

@@ -1,3 +1,9 @@
+**<span style="color:#56adda">0.1.15</span>**
+- Add a warning against using "Prefer Quality" when scaling a video down
+- Add smart output target support for QSV
+- Reduce sample time for black-box detection to 10 seconds of video
+- Fix smart output target bitrate derivation to prefer video-only stream stats (Matroska `BPS`) over container bitrate
+
 **<span style="color:#56adda">0.1.14</span>**
 - Enable smart filters and resolution scaling in basic mode (works only with NVENC at this stage)
 - Added new smart output target controls to basic mode, including goal presets (Prefer Quality/Balanced/Prefer Compression)
