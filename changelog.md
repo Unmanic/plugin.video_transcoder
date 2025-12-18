@@ -2,7 +2,8 @@
 - Add a warning against using "Prefer Quality" when scaling a video down
 - Add smart output target support for QSV
 - Reduce sample time for black-box detection to 10 seconds of video
-- Fix smart output target bitrate derivation to prefer video-only stream stats (Matroska `BPS`) over container bitrate
+- Fix smart output target bitrate derivation to prefer video-only stream stats (Matroska `BPS`) and packet sampling over container bitrate
+- Add ffprobe sampling as a fallback option when bitrate is not specified on a video stream
 
 **<span style="color:#56adda">0.1.14</span>**
 - Enable smart filters and resolution scaling in basic mode (works only with NVENC at this stage)

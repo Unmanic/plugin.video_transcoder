@@ -271,6 +271,7 @@ class NvencEncoder(Encoder):
                 if quality_index is not None:
                     stream_args += [f'-cq:v:{stream_id}', str(int(quality_index))]
                     # NVENC VBR target-quality mode still expects an average bitrate; set 0 so maxrate is the only rail.
+                    # REF: https://docs.nvidia.com/video-technologies/video-codec-sdk/12.1/nvenc-video-encoder-api-prog-guide/index.html?utm_source=chatgpt.com#finer-control-by-overriding-preset-parameters
                     stream_args += [f'-b:v:{stream_id}', '0']
                 maxrate = smart_recommendation.get("maxrate")
                 bufsize = smart_recommendation.get("bufsize")
