@@ -1,3 +1,6 @@
+**<span style="color:#56adda">0.1.16</span>**
+- Add support for using the File Metadata helper for storing details on moved files (Requires Unmanic v0.3.0)
+
 **<span style="color:#56adda">0.1.15</span>**
 - Add a warning against using "Prefer Quality" when scaling a video down
 - Add smart output target support for QSV

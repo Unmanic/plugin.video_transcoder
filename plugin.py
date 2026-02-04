@@ -147,7 +147,15 @@ class Settings(PluginSettings):
         }
 
 
-def file_marked_as_force_transcoded(path):
+def file_marked_as_force_transcoded(path, file_metadata=None):
+    if file_metadata:
+        try:
+            metadata = file_metadata.get()
+            if metadata.get('force_transcoded') is True or metadata.get('status') == 'force_transcoded':
+                return True
+        except Exception as e:
+            logger.debug("Unable to read UnmanicFileMetadata for '%s': %s", path, e)
+
     directory_info = UnmanicDirectoryInfo(os.path.dirname(path))
     try:
         has_been_force_transcoded = directory_info.get('video_transcoder', os.path.basename(path))
@@ -167,7 +175,7 @@ def file_marked_as_force_transcoded(path):
     return False
 
 
-def on_library_management_file_test(data):
+def on_library_management_file_test(data, file_metadata=None):
     """
     Runner function - enables additional actions during the library management file tests.
 
@@ -202,7 +210,7 @@ def on_library_management_file_test(data):
 
     # Check if this file needs to be processed
     if mapper.streams_need_processing():
-        if file_marked_as_force_transcoded(abspath) and mapper.forced_encode:
+        if file_marked_as_force_transcoded(abspath, file_metadata=file_metadata) and mapper.forced_encode:
             logger.debug(
                 "File '%s' has been previously marked as forced transcoded. Plugin found streams require processing, but will ignore this file.",
                 abspath)
@@ -214,7 +222,7 @@ def on_library_management_file_test(data):
         logger.debug("File '%s' does not contain streams require processing.", abspath)
 
 
-def on_worker_process(data):
+def on_worker_process(data, file_metadata=None):
     """
     Runner function - enables additional configured processing jobs during the worker stages of a task.
 
@@ -260,7 +268,7 @@ def on_worker_process(data):
     tools.append_worker_log(worker_log, "Checking what streams need processing...")
     needs_processing = mapper.streams_need_processing()
     if needs_processing:
-        if file_marked_as_force_transcoded(abspath) and mapper.forced_encode:
+        if file_marked_as_force_transcoded(abspath, file_metadata=file_metadata) and mapper.forced_encode:
             # Do not process this file, it has been force transcoded once before
             tools.append_worker_log(worker_log, "File previously force transcoded - skipping")
             return
@@ -310,7 +318,7 @@ def on_worker_process(data):
     return
 
 
-def on_postprocessor_task_results(data):
+def on_postprocessor_task_results(data, file_metadata=None):
     """
     Runner function - provides a means for additional postprocessor functions based on the task success.
 
@@ -325,6 +333,12 @@ def on_postprocessor_task_results(data):
     :param data:
     :return:
     """
+    # NOTE:
+    # This runner currently exists to support writing legacy `.unmanic` fallback data on
+    # older Unmanic versions where `file_metadata` is unavailable. Once `.unmanic`
+    # fallback support is removed, this runner can likely be removed and force-transcode
+    # metadata can be written during worker processing instead.
+
     # Get settings (do not persist defaults during post-processing)
     settings = Settings(library_id=data.get('library_id'), apply_default_fallbacks=False)
 
@@ -346,7 +360,14 @@ def on_postprocessor_task_results(data):
     if settings.get_setting('force_transcode'):
         cache_directory = os.path.dirname(data.get('final_cache_path'))
         if os.path.exists(os.path.join(cache_directory, '.force_transcode')):
-            directory_info = UnmanicDirectoryInfo(os.path.dirname(transcoded_file_path))
-            directory_info.set('video_transcoder', os.path.basename(transcoded_file_path), 'force_transcoded')
-            directory_info.save()
+            if file_metadata:
+                file_metadata.set({
+                    'force_transcoded': True,
+                    'status': 'force_transcoded',
+                })
+            else:
+                # Backward compatibility for older Unmanic versions without file_metadata helper.
+                directory_info = UnmanicDirectoryInfo(os.path.dirname(transcoded_file_path))
+                directory_info.set('video_transcoder', os.path.basename(transcoded_file_path), 'force_transcoded')
+                directory_info.save()
             logger.debug("Ignore on next scan written for '%s'.", transcoded_file_path)
