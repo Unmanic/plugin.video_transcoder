@@ -197,7 +197,12 @@ class GlobalSettings:
                     "label": encoder_details.get('label'),
                 }
             )
-        self.__set_default_option(values['select_options'], 'video_encoder')
+        selected_encoder = self.__set_default_option(values['select_options'], 'video_encoder')
+        if getattr(self.settings, 'apply_default_fallbacks', True):
+            current_encoder = self.settings.get_setting('video_encoder')
+            if selected_encoder and selected_encoder != current_encoder:
+                # Persist a compatible encoder when codec selection changes and invalidates the current value.
+                self.settings.set_setting('video_encoder', selected_encoder)
         if self.settings.get_setting('mode') not in ['basic', 'standard']:
             values["display"] = 'hidden'
         return values
