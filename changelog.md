@@ -1,3 +1,7 @@
+
+**<span style="color:#56adda">0.1.17</span>**
+- Add fixes to prevent error when doing hardware encode of file with streams that have have mid stream colorspace changes
+ 
 **<span style="color:#56adda">0.1.16</span>**
 - Add support for using the File Metadata helper for storing details on moved files (Requires Unmanic v0.3.0)
 - Fix issue with settings not chaing encoder when the codec changes

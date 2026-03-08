@@ -361,6 +361,10 @@ class NvencEncoder(Encoder):
             if self.settings.get_setting('nvenc_decoding_method') in ['cuda', 'nvdec']:
                 generic_kwargs["-hwaccel_output_format"] = "cuda"
 
+        # Prevent filter graph reconfiguration on mid-stream parameter changes
+        # (e.g., color space metadata changing partway through a file)
+        generic_kwargs["-reinit_filter"] = "0"
+
         return generic_kwargs, advanced_kwargs
 
     def generate_filtergraphs(self, current_filter_args, smart_filters, encoder_name):
@@ -414,6 +418,15 @@ class NvencEncoder(Encoder):
         # If we have no software filters:
         elif not hw_decode:
             # CPU decode -> setparams (if HDR) -> upload to CUDA
+            chain = [f"format={target_fmt}"]
+            if enc_supports_hdr and target_color_config.get('apply_color_params'):
+                chain.append(target_color_config['setparams_filter'])
+            chain.append("hwupload_cuda")
+            start_filter_args.append(",".join(chain))
+        else:
+            # HW decode, no SW filters: output software frames to avoid
+            # hwaccel reconfiguration on mid-stream color space changes
+            generic_kwargs['-hwaccel_output_format'] = target_fmt
             chain = [f"format={target_fmt}"]
             if enc_supports_hdr and target_color_config.get('apply_color_params'):
                 chain.append(target_color_config['setparams_filter'])
