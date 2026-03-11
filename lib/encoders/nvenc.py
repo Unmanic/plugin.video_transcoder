@@ -327,6 +327,7 @@ class NvencEncoder(Encoder):
         return {
             "nvenc_device":                        "none",
             "nvenc_decoding_method":               "cpu",
+            "nvenc_safe_decode":                   False,
             "nvenc_preset":                        "p4",
             "nvenc_tune":                          "auto",
             "nvenc_profile":                       "main",
@@ -360,6 +361,11 @@ class NvencEncoder(Encoder):
             }
             if self.settings.get_setting('nvenc_decoding_method') in ['cuda', 'nvdec']:
                 generic_kwargs["-hwaccel_output_format"] = "cuda"
+
+        # Prevent filter graph reconfiguration on mid-stream parameter changes
+        # (e.g., color space metadata changing partway through a file)
+        if self.settings.get_setting('nvenc_safe_decode'):
+            generic_kwargs["-reinit_filter"] = "0"
 
         return generic_kwargs, advanced_kwargs
 
@@ -414,6 +420,16 @@ class NvencEncoder(Encoder):
         # If we have no software filters:
         elif not hw_decode:
             # CPU decode -> setparams (if HDR) -> upload to CUDA
+            chain = [f"format={target_fmt}"]
+            if enc_supports_hdr and target_color_config.get('apply_color_params'):
+                chain.append(target_color_config['setparams_filter'])
+            chain.append("hwupload_cuda")
+            start_filter_args.append(",".join(chain))
+        # HW decode, no SW filters:
+        elif self.settings.get_setting('nvenc_safe_decode'):
+            # output software frames to avoid
+            # hwaccel reconfiguration on mid-stream color space changes
+            generic_kwargs['-hwaccel_output_format'] = target_fmt
             chain = [f"format={target_fmt}"]
             if enc_supports_hdr and target_color_config.get('apply_color_params'):
                 chain.append(target_color_config['setparams_filter'])
@@ -640,6 +656,18 @@ class NvencEncoder(Encoder):
             ]
         }
         if self.settings.get_setting('mode') not in ['standard']:
+            values["display"] = "hidden"
+        return values
+
+    def get_nvenc_safe_decode_form_settings(self):
+        values = {
+            "label": "Safe decode mode",
+            "description": "Forces CPU-side frame handling to prevent failures on files with "
+                           "inconsistent color space metadata (common in WEBDL sources).\n"
+                           "Slightly slower due to GPU->CPU->GPU round-trip per frame.",
+            "sub_setting": True,
+        }
+        if self.settings.get_setting('mode') not in ['standard'] or self.settings.get_setting('nvenc_decoding_method') == "cpu":
             values["display"] = "hidden"
         return values
 
