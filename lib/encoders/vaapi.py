@@ -5,7 +5,7 @@
 """
     plugins.vaapi.py
 
-    Written by:               Josh.5 <jsunnex@gmail.com>
+    Written by:               DeRoelO (Based on Josh.5)
     Date:                     08 Jun 2022, (8:15 AM)
 
     Copyright:
