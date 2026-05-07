@@ -1,4 +1,7 @@
 
+**<span style="color:#56adda">0.1.19</span>**
+- Corrected encoder options setting in plugin stream mapper for libsvtav1
+
 **<span style="color:#56adda">0.1.18</span>**
 - adds similar logic for qsv and vaapi as was done for nvenc in 0.1.17
 - adds new qsv_safe_decode and vaapi_safe_decode options to the respective encoders
