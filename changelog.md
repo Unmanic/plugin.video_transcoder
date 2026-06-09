@@ -1,5 +1,6 @@
 **<span style="color:#56adda">0.1.20</span>**
 - Corrected encoder options setting in plugin stream mapper for libsvtav1
+- Fix the libsvtav1 encoder integration so the stream mapper uses the correct encoder args contract
 
 **<span style="color:#56adda">0.1.19</span>**
 - adds the -reinit_filter:0 option for all decode modes of vaapi and qsv when h/w encode is used.
