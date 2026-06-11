@@ -5,7 +5,7 @@
 """
     plugins.vaapi.py
 
-    Written by:               Josh.5 <jsunnex@gmail.com>
+    Written by:               DeRoelO (Based on Josh.5)
     Date:                     08 Jun 2022, (8:15 AM)
 
     Copyright:
@@ -218,7 +218,8 @@ class VaapiEncoder(Encoder):
                 end_filter_args.append(",".join(end_chain))
             else:
                 # Pure HW path - frames stay in VAAPI memory
-                chain = [f"format={target_fmt}|vaapi", "hwupload"]
+                # We skip hwupload as it would attempt to upload hardware frames as software frames.
+                chain = ["format=vaapi"]
                 end_filter_args.append(",".join(chain))
                 
         # Add the smart filters to the end

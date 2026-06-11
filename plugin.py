@@ -4,7 +4,7 @@
 """
     plugins.plugin.py
 
-    Written by:               Josh.5 <jsunnex@gmail.com>
+    Written by:               DeRoelO (Based on Josh.5)
     Date:                     4 June 2022, (6:08 PM)
 
     Copyright:

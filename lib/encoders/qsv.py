@@ -4,7 +4,7 @@
 """
     plugins.qsv.py
 
-    Written by:               Josh.5 <jsunnex@gmail.com>
+    Written by:               DeRoelO (Based on Josh.5)
     Date:                     08 Jun 2022, (8:14 AM)
 
     Copyright:
@@ -253,9 +253,8 @@ class QsvEncoder(Encoder):
                 end_filter_args.append(",".join(end_chain))
             else:
                 # Pure HW path - frames stay in QSV memory
-                chain = [f"format={target_fmt}|qsv",
-                         "hwupload=extra_hw_frames=64",
-                         "format=qsv", f"vpp_qsv=format={target_fmt}"]
+                # We skip hwupload as it would attempt to upload hardware frames as software frames, causing corruption.
+                chain = ["format=qsv", f"vpp_qsv=format={target_fmt}"]
                 end_filter_args.append(",".join(chain))
                 
         # Add the smart filters to the end
@@ -317,7 +316,7 @@ class QsvEncoder(Encoder):
                 # Use default LA_ICQ mode
                 encoder_args += [
                     '-global_quality', str(defaults.get('qsv_constant_quality_scale')),
-                    '-look_ahead_depth', '100', '-extbrc', '1',
+                    '-look_ahead_depth', '40', '-extbrc', '1',
                 ]
                 if encoder_name in ["h264_qsv"]:
                     encoder_args += ['-look_ahead', '1']
@@ -351,7 +350,7 @@ class QsvEncoder(Encoder):
                         #     They enable lookahead via "-look_ahead_depth <N>" and "-extbrc 1" instead.
                         if encoder_name in ["h264_qsv"]:
                             encoder_args += ['-look_ahead', '1']
-                        encoder_args += ['-look_ahead_depth', '100', '-extbrc', '1']
+                        encoder_args += ['-look_ahead_depth', '40', '-extbrc', '1']
             else:
                 # Configure the QSV encoder with a bitrate-based mode
                 # Set the max and average bitrate (used by all bitrate-based modes)
@@ -360,7 +359,7 @@ class QsvEncoder(Encoder):
                     # Add lookahead
                     if encoder_name in ["h264_qsv"]:
                         encoder_args += ['-look_ahead', '1']
-                    encoder_args += ['-look_ahead_depth', '100', '-extbrc', '1']
+                    encoder_args += ['-look_ahead_depth', '40', '-extbrc', '1']
                 elif self.settings.get_setting('qsv_encoder_ratecontrol_method') == 'CBR':
                     # Add 'maxrate' with the same value to make CBR mode
                     encoder_args += ['-maxrate', f"{self.settings.get_setting('qsv_average_bitrate')}M"]
