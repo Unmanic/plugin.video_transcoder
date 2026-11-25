@@ -1,3 +1,8 @@
+**<span style="color:#56adda">0.1.21</span>**
+- Add NVENC option "Use CPU decode for these source codecs" (nvenc_cpu_decode_codecs)
+- Sources with a listed codec (eg. "av1" on GPUs older than Ampere) are decoded on the CPU even when HW decoding is enabled. The GPU still encodes
+- Pass the file probe to the encoder when building the default (decoder) args
+
 **<span style="color:#56adda">0.1.20</span>**
 - Corrected encoder options setting in plugin stream mapper for libsvtav1
 - Fix the libsvtav1 encoder integration so the stream mapper uses the correct encoder args contract

@@ -109,7 +109,7 @@ class PluginStreamMapper(StreamMapper):
         # Build hardware acceleration args based on encoder
         # Note: these are not applied to advanced mode - advanced mode was returned above
         encoder_name = self.settings.get_setting('video_encoder')
-        encoder_lib = tools.available_encoders(settings=self.settings).get(encoder_name)
+        encoder_lib = tools.available_encoders(settings=self.settings, probe=probe).get(encoder_name)
         if encoder_lib:
             generic_kwargs, advanced_kwargs = encoder_lib.generate_default_args()
             self.set_ffmpeg_generic_options(**generic_kwargs)
