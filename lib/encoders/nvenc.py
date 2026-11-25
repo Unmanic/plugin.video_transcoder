@@ -37,6 +37,20 @@ from video_transcoder.lib.encoders.base import Encoder
 
 logger = logging.getLogger("Unmanic.Plugin.video_transcoder")
 
+HW_DECODE_METHODS = ('cuda', 'nvdec', 'cuvid')
+
+
+@lru_cache(maxsize=8)
+def parse_cpu_decode_codecs(value):
+    """
+    Parse the 'nvenc_cpu_decode_codecs' setting.
+    The value is a comma or space separated list of ffprobe codec names. Example: "av1"
+
+    :param value:
+    :return: frozenset of lower case codec names
+    """
+    return frozenset(c for c in re.split(r'[,\s]+', str(value or '').lower()) if c)
+
 
 @lru_cache(maxsize=1)
 def list_available_cuda_devices():
@@ -328,6 +342,7 @@ class NvencEncoder(Encoder):
             "nvenc_device":                        "none",
             "nvenc_decoding_method":               "cpu",
             "nvenc_safe_decode":                   False,
+            "nvenc_cpu_decode_codecs":             "",
             "nvenc_preset":                        "p4",
             "nvenc_tune":                          "auto",
             "nvenc_profile":                       "main",
@@ -338,6 +353,29 @@ class NvencEncoder(Encoder):
             "nvenc_enable_temporal_aq":            False,
             "nvenc_aq_strength":                   8,
         }
+
+    def _source_in_cpu_decode_list(self):
+        """
+        Return True if the codec of the source video stream is in the 'nvenc_cpu_decode_codecs' setting.
+
+        :return:
+        """
+        codecs = parse_cpu_decode_codecs(self.settings.get_setting('nvenc_cpu_decode_codecs'))
+        if not codecs or not self.probe:
+            return False
+        video_stream = self.probe.get_first_video_stream() or {}
+        return str(video_stream.get('codec_name') or '').lower() in codecs
+
+    def _hw_decode_method(self):
+        """
+        Return the HW decode method to use for this source, or None to decode on the CPU.
+
+        :return:
+        """
+        decoding_method = str(self.settings.get_setting('nvenc_decoding_method') or '').lower()
+        if decoding_method not in HW_DECODE_METHODS or self._source_in_cpu_decode_list():
+            return None
+        return decoding_method
 
     def generate_default_args(self):
         """
@@ -352,14 +390,17 @@ class NvencEncoder(Encoder):
         generic_kwargs = {}
         advanced_kwargs = {}
         # Check if we are using a HW accelerated decoder also
-        if self.settings.get_setting('nvenc_decoding_method') in ['cuda', 'nvdec', 'cuvid']:
+        decoding_method = self._hw_decode_method()
+        if decoding_method is None and self.settings.get_setting('nvenc_decoding_method') in HW_DECODE_METHODS:
+            logger.info("Source video codec is in the CPU decode list. Using CPU decode for this file.")
+        if decoding_method:
             generic_kwargs = {
                 "-hwaccel_device":   hardware_device.get('hwaccel_device', 0),
-                "-hwaccel":          self.settings.get_setting('nvenc_decoding_method'),
+                "-hwaccel":          decoding_method,
                 "-init_hw_device":   "cuda=hw",
                 "-filter_hw_device": "hw",
             }
-            if self.settings.get_setting('nvenc_decoding_method') in ['cuda', 'nvdec']:
+            if decoding_method in ['cuda', 'nvdec']:
                 generic_kwargs["-hwaccel_output_format"] = "cuda"
 
         # Prevent filter graph reconfiguration on mid-stream parameter changes
@@ -393,7 +434,7 @@ class NvencEncoder(Encoder):
         # Check for HW accelerated decode mode
         # All decode methods ('cuda', 'nvdec', 'cuvid') are handled by the same
         # filtergraph logic and output CUDA frames. The main FFmpeg command handles the specific decoder.
-        hw_decode = (self.settings.get_setting('nvenc_decoding_method') or '').lower() in ('cuda', 'nvdec', 'cuvid')
+        hw_decode = self._hw_decode_method() is not None
 
         # Check software format to use
         target_fmt = self._target_pix_fmt_for_encoder(encoder_name)
@@ -555,7 +596,7 @@ class NvencEncoder(Encoder):
             stream_args += [f'-temporal-aq:v:{stream_id}', '1']
 
         # If CUVID is enabled, return generic_kwargs
-        if (self.settings.get_setting('nvenc_decoding_method') or '').lower() in ['cuvid']:
+        if self._hw_decode_method() == 'cuvid':
             in_codec = stream_info.get('codec_name', 'unknown_codec_name')
             generic_kwargs = {f'-c:v:{stream_id}': f'{in_codec}_cuvid'}
 
@@ -665,6 +706,18 @@ class NvencEncoder(Encoder):
             "description": "Forces CPU-side frame handling to prevent failures on files with "
                            "inconsistent color space metadata (common in WEBDL sources).\n"
                            "Slightly slower due to GPU->CPU->GPU round-trip per frame.",
+            "sub_setting": True,
+        }
+        if self.settings.get_setting('mode') not in ['standard'] or self.settings.get_setting('nvenc_decoding_method') == "cpu":
+            values["display"] = "hidden"
+        return values
+
+    def get_nvenc_cpu_decode_codecs_form_settings(self):
+        values = {
+            "label":       "Use CPU decode for these source codecs",
+            "description": "Comma separated list of source video codec names (as reported by ffprobe) that are always "
+                           "decoded on the CPU, even when HW decoding is enabled. The GPU is still used to encode.\n"
+                           "Use this for codecs your GPU cannot decode. Example for GPUs older than Ampere: av1",
             "sub_setting": True,
         }
         if self.settings.get_setting('mode') not in ['standard'] or self.settings.get_setting('nvenc_decoding_method') == "cpu":
